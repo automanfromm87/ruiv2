@@ -14,13 +14,26 @@ pub mod dom;
 pub mod gql;
 pub mod reactive;
 pub mod runtime;
+pub mod view;
+
+pub use view::{node_ref, NodeRef, Page, Strategy, View};
+// 生命周期:on_mount(节点入 DOM 后,客户端)/ on_cleanup(scope 销毁时)。
+pub use reactive::on_cleanup;
+pub use runtime::on_mount;
+// 路由:`param(i)`/`param_as::<T>(i)` 读 path 第 i 段(reactive,通常由 `#[rui::page]` 据模式串自动接);
+// `query_param("k")`/`query_param_as::<T>("k")` 读 `?k=`(在 body 里按需读,独立于 path);
+// `path()`/`query_string()` 原始 signal;`go` 程序化导航(pushState);`matches` 给 `router!` 分发。
+pub use runtime::{
+    go, matches, navigate, param, param_as, path, query_encode, query_param, query_param_as, query_string,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod server;
 
 // 宏:应用直接用 rui::view! / rui::query! / #[derive(rui::GqlObject)] / #[rui::gql_root(..)] 等。
 pub use rui_macros::{
-    fragment, gql_fields, gql_root, gql_schema, mutation, paginated, query, subscription, view, GqlObject,
+    component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource, router,
+    subscription, view, GqlObject,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,7 +47,9 @@ pub use gql::exec::empty_resolver;
 pub mod prelude {
     pub use crate::gql::{FromValue, IntoValue, ToGqlArg, Value};
     pub use crate::reactive::{effect, memo, scope, Signal};
+    pub use crate::view::{IntoView, View};
     pub use rui_macros::{
-        fragment, gql_fields, gql_root, gql_schema, mutation, paginated, query, subscription, view, GqlObject,
+        component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource, router,
+        subscription, view, GqlObject,
     };
 }

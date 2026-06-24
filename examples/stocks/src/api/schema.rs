@@ -1,16 +1,7 @@
-//! 后端 API —— 「写方法即 schema」。
-//!
-//! 每个根(Query/Mutation/Subscription)是一个普通 impl,方法签名就是 schema:
-//!   · 方法名      → GraphQL 根字段名
-//!   · 参数        → 字段参数(执行器按类型从 args 提取)
-//!   · 返回类型    → 字段返回类型(`#[gql_root]` 据此生成 Field 投影,供前端 query! 编译期校验)
-//!   · 方法体      → resolver(仅服务端编译;调 crate::api::stocks / crate::api::orders 的数据函数)
-//!
-//! 注:同一根的方法须在一个 #[gql_root] 块内(宏对每个根生成一份 Root + resolve,不能分散);
-//! 数据实现按领域拆到 stocks.rs / orders.rs。
-#![allow(dead_code)] // 根 struct 的方法体仅服务端编译;wasm 端只用其类型层 schema
+//! 后端 API —— 「写方法即 schema」。方法签名就是 GraphQL schema;方法体是 resolver(仅服务端)。
+#![allow(dead_code)] // 根 struct 方法体仅服务端编译;wasm 端只用类型层 schema
 
-use crate::data::model::{Order, Stock, StockConnection};
+use crate::data::model::{Todo, TodoConnection};
 use rui::gql_root;
 
 pub struct Query;
@@ -19,32 +10,46 @@ pub struct Subscription;
 
 #[gql_root(query)]
 impl Query {
-    fn stocks(&self) -> Vec<Stock> {
-        crate::api::stocks::all_stocks()
+    fn todos(&self) -> Vec<Todo> {
+        crate::api::todos::all()
     }
-    fn stock(&self, id: String) -> Vec<Stock> {
-        crate::api::stocks::stock(&id)
+    // Relay 游标分页:归档页用。
+    fn todo_page(&self, first: i64, after: String) -> Vec<TodoConnection> {
+        crate::api::todos::page(first, &after)
     }
-    fn orders(&self) -> Vec<Order> {
-        crate::api::orders::orders()
+    // 服务端按文本过滤(resource! 搜索演示)。
+    fn search(&self, q: String) -> Vec<Todo> {
+        crate::api::todos::search(&q)
     }
-    // Relay connection 分页:first/after 游标分页,返回 StockConnection。
-    fn stock_page(&self, first: i64, after: String) -> Vec<StockConnection> {
-        crate::api::stocks::page(first, &after)
+    // 单条详情(路由参数页 /todo/:id 用):按 id 查,Vec 0/1 条。
+    fn detail(&self, id: String) -> Vec<Todo> {
+        crate::api::todos::detail(&id)
     }
 }
 
 #[gql_root(mutation)]
 impl Mutation {
-    fn set_price(&self, symbol: String, price: f64) -> Vec<Stock> {
-        crate::api::stocks::set_price(&symbol, price)
+    fn add_todo(&self, text: String) -> Vec<Todo> {
+        crate::api::todos::add(&text)
+    }
+    fn toggle_todo(&self, id: String) -> Vec<Todo> {
+        crate::api::todos::toggle(&id)
+    }
+    fn remove_todo(&self, id: String) -> Vec<Todo> {
+        crate::api::todos::remove(&id)
+    }
+    fn clear_done(&self) -> Vec<Todo> {
+        crate::api::todos::clear_done()
+    }
+    fn complete_all(&self) -> Vec<Todo> {
+        crate::api::todos::complete_all()
     }
 }
 
 #[gql_root(subscription)]
 impl Subscription {
-    fn price_updates(&self) -> Vec<Stock> {
-        crate::api::stocks::all_stocks()
+    fn todo_updates(&self) -> Vec<Todo> {
+        crate::api::todos::all()
     }
 }
 

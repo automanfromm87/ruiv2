@@ -22,7 +22,7 @@
 pub mod value;
 
 #[allow(unused_imports)]
-pub use value::{parse, FromValue, IntoValue, Value};
+pub use value::{errors_message, parse, FromValue, IntoValue, Value};
 
 // 客户端规范化缓存(前后端同构 query! 两端都用到)。
 pub mod store;

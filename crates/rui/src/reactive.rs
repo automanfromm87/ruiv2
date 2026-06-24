@@ -24,6 +24,18 @@ thread_local! {
     static EFFECTS: RefCell<Vec<Option<EffectNode>>> = const { RefCell::new(Vec::new()) };
     /// owner 栈:scope() 期间创建的 effect id 会登记到栈顶,供整组 dispose(路由切换用)。
     static OWNER: RefCell<Vec<Vec<usize>>> = const { RefCell::new(Vec::new()) };
+    /// cleanup 栈:scope() 期间 on_cleanup 注册的回调登记到栈顶,scope 销毁时执行(卸载副作用)。
+    static CLEANUPS: RefCell<Vec<Vec<Box<dyn FnOnce()>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 注册一个卸载回调:当前 `scope`(页面 / 子树)被销毁时执行 —— 清定时器 / 解绑 / 销毁第三方实例。
+/// 不在任何 scope 内调用则忽略(无归属)。服务端:scope 渲染后即 drop,回调随之执行(DOM 操作是 no-op)。
+pub fn on_cleanup(f: impl FnOnce() + 'static) {
+    CLEANUPS.with(|c| {
+        if let Some(top) = c.borrow_mut().last_mut() {
+            top.push(Box::new(f));
+        }
+    });
 }
 
 /// 响应式状态单元。在 effect 内 `get()` = 订阅;`set()` = 通知订阅者重跑。
@@ -92,14 +104,18 @@ pub fn effect<F: Fn() + 'static>(f: F) -> EffectHandle {
 /// 规范化缓存的「查询视图」即 memo:从 store 按 selection 重建结果 + 订阅相关 entity。
 pub fn memo<T, F>(f: F) -> Signal<T>
 where
-    T: Clone + 'static,
+    T: Clone + PartialEq + 'static,
     F: Fn() -> T + 'static,
 {
     let sig = Signal::new(untrack(&f)); // 初值非追踪求,避免污染外层 effect 依赖集
     let out = sig.clone();
     effect(move || {
         let v = f(); // 在本 effect 上下文 → 自动订阅 f 读到的 signal
-        sig.set(v); // 通知本 memo 的下游
+        // 值相等去抖:派生值真没变就不通知下游 —— 否则无关依赖变化(如 ?q 不变但 ?sort 变)
+        // 也会让本 memo 重通知 → 订阅它的 resource! 冗余重取。untrack 读自身值,避免自订阅成环。
+        if untrack(|| sig.get()) != v {
+            sig.set(v); // 通知本 memo 的下游
+        }
     });
     out
 }
@@ -135,16 +151,21 @@ fn run_effect(id: usize) {
 }
 
 fn dispose_effect(id: usize) {
-    EFFECTS.with(|e| {
-        let mut e = e.borrow_mut();
-        if let Some(slot) = e.get_mut(id) {
-            if let Some(node) = slot.take() {
-                for dep in node.deps {
-                    dep.borrow_mut().retain(|&x| x != id);
-                }
-            }
+    // 先取出节点并放掉 EFFECTS 借用,再让它(及其闭包)析构 —— 闭包可能持有子 Scope,
+    // 其 Drop 会重入 dispose_effect;若在借用内析构会触发 RefCell 双重借用 panic。
+    //
+    // 用 try_with:线程结束销毁 thread_local 时,残留的 Scope/effect 闭包会被 drop,从而
+    // 重入到这里;此刻 EFFECTS 可能已在析构(每连接一线程的 SSR 必然触发),with 会 panic
+    // (TLS 析构期访问 → abort)。整个 arena 反正在拆,访问不到就直接跳过。
+    let node = EFFECTS
+        .try_with(|e| e.borrow_mut().get_mut(id).and_then(|slot| slot.take()))
+        .ok()
+        .flatten();
+    if let Some(node) = node {
+        for dep in node.deps {
+            dep.borrow_mut().retain(|&x| x != id);
         }
-    });
+    }
 }
 
 fn register_owned(id: usize) {
@@ -169,19 +190,42 @@ impl EffectHandle {
 /// 返回的 Scope 可一次性 dispose 全部(路由切换前清理上一页的视图)。
 pub struct Scope {
     ids: Vec<usize>,
+    cleanups: Vec<Box<dyn FnOnce()>>,
 }
 impl Scope {
-    pub fn dispose(self) {
-        for id in self.ids {
+    /// 显式、即时销毁本作用域内全部 effect/memo(等价于让 Scope 离开作用域被 drop)。
+    pub fn dispose(self) {}
+    /// 取走本 scope 的 effect id + cleanup(取空后让其 drop 即无副作用)。
+    pub fn take_parts(&mut self) -> (Vec<usize>, Vec<Box<dyn FnOnce()>>) {
+        (std::mem::take(&mut self.ids), std::mem::take(&mut self.cleanups))
+    }
+    /// 把另一组 effect id + cleanup 并入本 scope(on_mount 回调在子 scope 跑完后并入页面 scope,
+    /// 使其中创建的 effect/memo 归当前页所有 → 切页时一并销毁,杜绝幽灵 effect)。
+    pub fn absorb_parts(&mut self, ids: Vec<usize>, cleanups: Vec<Box<dyn FnOnce()>>) {
+        self.ids.extend(ids);
+        self.cleanups.extend(cleanups);
+    }
+}
+// Drop 即销毁:先跑 on_cleanup 回调(节点还在、信号还可读),再 dispose 本组 effect/memo。
+// 于是嵌套作用域(如 reactive_block 每次重建的子作用域)在其父 effect 被销毁、闭包随之析构、
+// 持有的子 Scope 被 drop 时也会递归清理 —— 无需手工逐层 dispose。
+impl Drop for Scope {
+    fn drop(&mut self) {
+        for c in std::mem::take(&mut self.cleanups) {
+            c(); // 卸载回调(clear_interval / 解绑 / 销毁第三方实例)
+        }
+        for id in std::mem::take(&mut self.ids) {
             dispose_effect(id);
         }
     }
 }
 pub fn scope<R>(f: impl FnOnce() -> R) -> (R, Scope) {
     OWNER.with(|o| o.borrow_mut().push(Vec::new()));
+    CLEANUPS.with(|c| c.borrow_mut().push(Vec::new()));
     let r = f();
     let ids = OWNER.with(|o| o.borrow_mut().pop().unwrap_or_default());
-    (r, Scope { ids })
+    let cleanups = CLEANUPS.with(|c| c.borrow_mut().pop().unwrap_or_default());
+    (r, Scope { ids, cleanups })
 }
 
 #[cfg(test)]

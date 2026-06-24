@@ -116,6 +116,44 @@ fn write_json_str(s: &str, out: &mut String) {
 
 // ───────────────────────────── parser ─────────────────────────────
 
+/// 从 GraphQL 响应里提取错误信息;无错误返回 None。数据层据此把失败传到 UI
+/// (resource! 的 error 态、mutation! 的 on_error)。把"非法响应"也当失败,避免 HTTP 错误页 /
+/// 解析垃圾被当成空成功(只有结构正确的 `{data, errors:[]}` / `{data, ...}` 才算成功):
+///   · 非 JSON 对象(HTML 错误页 / 裸值 / 解析失败)→ 失败
+///   · errors 是非空 list → 连接 message
+///   · errors 缺失 → 有 data 才算成功,否则失败(缺 data/errors)
+///   · errors 存在但不是 list(null/对象/字符串/数字)→ 失败(格式错误)
+pub fn errors_message(v: &Value) -> Option<String> {
+    if !matches!(v, Value::Object(_)) {
+        return Some("非法响应(非 JSON 对象)".to_string());
+    }
+    match v.get("errors") {
+        None => {
+            if v.get("data").is_some() {
+                None // 标准成功信封 {data, ...}
+            } else {
+                Some("非法响应(缺少 data/errors)".to_string())
+            }
+        }
+        Some(Value::List(errs)) if errs.is_empty() => None, // 显式成功 errors:[]
+        Some(Value::List(errs)) => {
+            let msgs: Vec<String> = errs
+                .iter()
+                .map(|e| {
+                    let m = e.field("message").as_str();
+                    if m.is_empty() {
+                        "GraphQL 错误".to_string()
+                    } else {
+                        m.to_string()
+                    }
+                })
+                .collect();
+            Some(msgs.join("; "))
+        }
+        Some(_) => Some("非法响应(errors 字段格式错误)".to_string()),
+    }
+}
+
 pub fn parse(s: &str) -> Value {
     let mut p = P { b: s.as_bytes(), i: 0 };
     p.ws();
@@ -409,5 +447,27 @@ mod tests {
     fn from_value_collections() {
         let xs: Vec<i64> = FromValue::from_value(&parse("[1,2,3]"));
         assert_eq!(xs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn errors_message_classification() {
+        // 成功:有 data + 空 errors / 缺 errors
+        assert_eq!(errors_message(&parse(r#"{"data":{"x":1},"errors":[]}"#)), None);
+        assert_eq!(errors_message(&parse(r#"{"data":{"x":1}}"#)), None);
+        // 失败:非空 errors → 连接 message
+        assert_eq!(
+            errors_message(&parse(r#"{"data":null,"errors":[{"message":"boom"}]}"#)),
+            Some("boom".to_string())
+        );
+        assert_eq!(
+            errors_message(&parse(r#"{"errors":[{"message":"a"},{"message":"b"}]}"#)),
+            Some("a; b".to_string())
+        );
+        // 失败:非法响应(非对象 / 缺 data&errors / errors 非 list)
+        assert!(errors_message(&parse("0")).is_some()); // 非 JSON → parse 兜底成数字 → 非对象
+        assert!(errors_message(&parse("{}")).is_some()); // 缺 data/errors
+        assert!(errors_message(&parse(r#"{"errors":"boom"}"#)).is_some()); // errors 非 list
+        // error 无 message → 占位,不丢失"有错误"信号
+        assert_eq!(errors_message(&parse(r#"{"errors":[{}]}"#)), Some("GraphQL 错误".to_string()));
     }
 }

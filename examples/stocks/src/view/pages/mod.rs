@@ -1,10 +1,7 @@
 pub mod about;
-pub mod cards;
-pub mod counter;
-pub mod feed;
+pub mod archive;
+pub mod detail;
+pub mod draft;
 pub mod index;
-pub mod live;
-pub mod mac;
-pub mod orders;
-pub mod stock;
-pub mod table;
+pub mod overview; // /dash 组成员
+pub mod settings; // /dash 组成员

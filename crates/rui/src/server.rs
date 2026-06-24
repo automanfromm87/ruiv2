@@ -44,8 +44,8 @@ pub struct Sse {
 /// 一个 rui 应用:路由 + GraphQL resolver +(可选)订阅。
 #[derive(Clone, Copy)]
 pub struct App {
-    /// 路径 → 页面根节点(应用提供;内部用 view! 组装 layout + page)。
-    pub route: fn(&str) -> u32,
+    /// 路径 → Page(策略 + 延迟渲染);由 `#[rui::page]` + route() 提供。
+    pub route: fn(&str) -> crate::view::Page,
     /// GraphQL resolver(应用用一个 match 聚合 #[gql_root] 生成的各 Root::resolve)。
     pub resolve: Resolver,
     /// 可选订阅(subscription)。
@@ -64,11 +64,13 @@ pub fn serve(app: App) {
     }
 }
 
-/// 服务端渲染:按路径渲染对应页,产出 HTML 片段(同构,query! 本地预取带数据)。
-pub fn render_to_string(route: fn(&str) -> u32, path: &str) -> String {
+/// 服务端渲染一个 Page 的 render 闭包,产出 HTML 片段(同构,query! 本地预取带数据)。
+fn render_page(p: crate::view::Page) -> String {
     crate::dom::reset();
     crate::gql::store::reset(); // 清空规范化缓存,保证请求间隔离
-    crate::runtime::render_path(route, path);
+    let render = p.render;
+    let (node, _sc) = crate::reactive::scope(move || render()); // SSR 一次性:effect 立即跑填好 signal,scope 随后 drop
+    crate::dom::mount(node.node());
     crate::dom::take_html()
 }
 
@@ -114,7 +116,14 @@ fn content_length(headers: &[u8]) -> usize {
 fn handle(mut s: TcpStream, app: App) {
     let raw = read_request(&mut s);
     let req = String::from_utf8_lossy(&raw);
-    let path = req.split_whitespace().nth(1).unwrap_or("/");
+    let target = req.split_whitespace().nth(1).unwrap_or("/");
+    // 拆成 pathname + query(fragment 浏览器不会发,稳妥起见也去掉):pathname 走路由匹配 / path 参数,
+    // query 单独喂 query 参数(两条线)。修了 /todo/1?x=1 的 param 不再变 "1?x=1"、/about?utm=x 不掉 404。
+    let no_frag = target.split('#').next().unwrap_or(target);
+    let (path, query) = match no_frag.split_once('?') {
+        Some((p, q)) => (if p.is_empty() { "/" } else { p }, q),
+        None => (if no_frag.is_empty() { "/" } else { no_frag }, ""),
+    };
 
     // ── subscription:SSE 长连接(本线程独占,循环推送)──
     if path.starts_with("/graphql/subscribe") {
@@ -143,7 +152,7 @@ fn handle(mut s: TcpStream, app: App) {
     } else if path == "/styles.css" {
         file("web/styles.css", "text/css; charset=utf-8")
     } else {
-        ("200 OK", "text/html; charset=utf-8", page(app.route, path).into_bytes())
+        ("200 OK", "text/html; charset=utf-8", page(app.route, path, query).into_bytes())
     };
 
     let header = format!(
@@ -161,13 +170,60 @@ fn file(p: &str, ctype: &'static str) -> (&'static str, &'static str, Vec<u8>) {
     }
 }
 
-fn page(route: fn(&str) -> u32, path: &str) -> String {
-    let app_html = render_to_string(route, path);
+// 按 #[rui::page] 策略产出整页 HTML:
+//   Ssr    渲染 + 注入数据(客户端水合)
+//   Csr    只发空壳(#app 为空、无数据)→ 客户端探测到无 SSR 内容,走纯 CSR
+//   Static 首次按 Ssr 渲染后按 path 缓存,后续直接复用
+fn page(route: fn(&str) -> crate::view::Page, path: &str, query: &str) -> String {
+    use crate::view::Strategy;
+    crate::runtime::set_current_path(path); // path 参数:让首屏 param() 读到正确段
+    crate::runtime::set_current_query(query); // query 参数:让首屏 query_param() 读到正确值
+    let pg = route(path);
+    match pg.strategy {
+        Strategy::Csr => doc("", ""),
+        Strategy::Ssr => ssr_doc(pg),
+        Strategy::Static => {
+            static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+            let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            // 缓存键含 query(query 依赖型 static 页各参数各缓存一份);参数排序使 ?a=1&b=2 与 ?b=2&a=1 命中同一份。
+            let key = if query.is_empty() {
+                path.to_string()
+            } else {
+                let mut parts: Vec<&str> = query.split('&').filter(|s| !s.is_empty()).collect();
+                parts.sort_unstable();
+                format!("{path}?{}", parts.join("&"))
+            };
+            if let Some(h) = cache.lock().unwrap().get(&key) {
+                return h.clone();
+            }
+            let html = ssr_doc(pg);
+            // 上限保护:防任意 query 串(?utm=.. 等)无界增长 / 缓存洪泛;满了就停止缓存(继续按需渲染)。
+            let mut map = cache.lock().unwrap();
+            if map.len() < 1024 {
+                map.insert(key, html.clone());
+            }
+            html
+        }
+    }
+}
+
+// SSR:渲染 + 把本次 query 响应注入页面(客户端首屏复用,免重新联网)。
+fn ssr_doc(pg: crate::view::Page) -> String {
+    let app_html = render_page(pg); // 渲染时填充 SSR 响应缓存
+    // `</` → `<\/` 防止数据里出现 `</script>` 截断标签(JSON 里 \/ 合法)。
+    let data = crate::dom::dehydrate_responses().replace("</", "<\\/");
+    doc(&app_html, &data)
+}
+
+// 整页 HTML 骨架。app_html 为空 + data 为空 = CSR 空壳。
+fn doc(app_html: &str, data: &str) -> String {
     format!(
         "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>rui</title><link rel=\"stylesheet\" href=\"/styles.css\"></head>\
+<title>rui</title><style>rui-slot,rui-frag{{display:contents}}</style>\
+<link rel=\"stylesheet\" href=\"/styles.css\"></head>\
 <body><div id=\"app\">{app_html}</div>\
+<script id=\"__rui_data\" type=\"application/json\">{data}</script>\
 <script type=\"module\" src=\"/router.js\"></script></body></html>"
     )
 }
