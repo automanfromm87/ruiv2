@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/rui", "crates/rui-macros", "crates/rui-cli", "examples/stocks"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

@@ -1,0 +1,9 @@
+# Rust 构建产物
+/target
+**/target
+
+# rui dev / build 生成的前端产物(wasm + css,由 `rui dev` 重新生成)
+/examples/stocks/web/
+
+# macOS
+.DS_Store

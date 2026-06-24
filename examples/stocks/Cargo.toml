@@ -1,0 +1,15 @@
+[package]
+name = "stocks"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rui = { path = "../../crates/rui" }
+rui-macros = { path = "../../crates/rui-macros" }
+
+[[bin]]
+name = "ssr"
+path = "src/bin/ssr.rs"
