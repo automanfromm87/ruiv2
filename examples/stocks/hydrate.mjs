@@ -28,6 +28,7 @@ async function run(path, responses, claimFrom) {
     set_attr: () => {},
     set_value: () => {},
     set_checked: () => {},
+    console_error: () => {},
     add_class: () => {},
     remove_class: () => {},
     set_timeout: () => {},

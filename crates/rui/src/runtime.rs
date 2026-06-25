@@ -342,6 +342,14 @@ pub unsafe fn on_fetch(id: u32, ptr: *mut u8, len: usize) {
     flush_mounts(); // resource!/query! 结果到达后构建的行(keyed <For>)的 on_mount,这里跑
 }
 
+/// 安装 panic hook:wasm panic 默认会静默 trap → 白屏无任何提示。装上后 panic 的消息 + 源码位置
+/// 会先打到浏览器 console.error,再 abort —— 至少不"静默崩溃",便于排查。由 client! 的 `init` 启动时调一次。
+pub fn set_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        crate::dom::console_error(&format!("rui panic: {info}"));
+    }));
+}
+
 /// 在应用 crate 里生成 wasm 客户端入口(导出 alloc/render_route/dispatch/on_fetch)。
 /// 用法(应用 lib.rs):`rui::client!(crate::route);`
 #[macro_export]
@@ -354,6 +362,12 @@ macro_rules! client {
         #[no_mangle]
         pub extern "C" fn alloc(len: usize) -> *mut u8 {
             $crate::runtime::alloc(len)
+        }
+        // 启动初始化(router.js 实例化后、渲染前调一次):装 panic hook 防静默白屏。
+        #[cfg(target_arch = "wasm32")]
+        #[no_mangle]
+        pub extern "C" fn init() {
+            $crate::runtime::set_panic_hook();
         }
         #[cfg(target_arch = "wasm32")]
         #[no_mangle]

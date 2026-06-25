@@ -30,6 +30,7 @@ async function fresh() {
     set_attr: (id, np, nl, vp, vl) => { (nodes[id].attrs ||= {})[str(np, nl)] = str(vp, vl); },
     set_value: (id, p, l) => { nodes[id].value = str(p, l); },
     set_checked: (id, on) => { if (nodes[id]) nodes[id].checked = !!on; }, // 受控复选框/单选
+    console_error: (p, l) => console.error(str(p, l)), // panic hook
     add_class: (id, p, l) => { const n = nodes[id]; if (n) (n.cls ||= new Set()).add(str(p, l)); }, // 过渡 enter/leave 类
     remove_class: (id, p, l) => { const n = nodes[id]; if (n && n.cls) n.cls.delete(str(p, l)); },
     set_timeout: (ms, h) => { timeouts.push({ ms, h }); }, // 记录,测试手动 runTimeouts 触发(控制时序)
@@ -472,6 +473,18 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   // 分隔控制符剥除:value "x\x1fy" 应被剥成 "xy"(2 字),而非截断成 "x"(1 字)
   f.fireEvent(2, { value: "x\x1fy" });
   check(f.has("2/80") && !f.liveHas("1/80"), "/         输入含分隔控制符 → 被剥除不截断(x\\x1fy→xy,2 字)");
+}
+
+// 24) 可选/默认 props(typed builder)+ panic hook init
+{
+  const f = await fresh();
+  f.render("/");
+  f.onFetch(TODOS);
+  check(f.liveHas("(可选 prop:其它页的 Panel 省略它)"), "/         Panel 提供可选 subtitle → 渲染(其它页省略它仍编译+渲染 = 可选 prop 生效)");
+  // panic hook:init 导出存在且可调(装 hook;真 panic 日志由浏览器侧验证)
+  check(typeof f.X.init === "function", "         client! 导出 init(panic hook 安装入口)");
+  f.X.init();
+  check(true, "         调用 init() 安装 panic hook 不报错");
 }
 
 console.log(ok ? "✅ 全部通过" : "❌ 有失败");

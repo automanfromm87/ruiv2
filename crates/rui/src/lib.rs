@@ -12,6 +12,7 @@
 
 pub mod dom;
 pub mod gql;
+pub mod props; // #[component] typed-builder 支持(Missing/Set/OrDefault)
 pub mod reactive;
 pub mod runtime;
 pub mod view;

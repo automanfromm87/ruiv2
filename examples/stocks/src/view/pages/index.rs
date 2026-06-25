@@ -83,7 +83,7 @@ pub fn view() -> rui::View {
                         on:click={ move || reset() }>"重试"</button>
                 </div>
             } }>
-                <Panel title="清单">
+                <Panel title="清单" subtitle="(可选 prop:其它页的 Panel 省略它)">
                     <GreetingBadge /> // 深层组件,经 context 取/写页面 provide 的 Greeting(无 props 传递)
                     <StatusBanner total={ total.clone() } active={ active.clone() } />
                     // 列表 / 空状态(行类型 __Row 不可命名,故 For 留在页面;每行 TodoItem 用 mutation! 运行时参数)

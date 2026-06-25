@@ -483,21 +483,22 @@ fn gen_node(n: &Node) -> TS2 {
         Node::El { tag, attrs, children } => {
             let is_component = tag.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
             if is_component {
-                // 组件:具名 props(按名匹配、类型由编译器校验)+ children 槽。
-                // <Card title=.. sub={x}>子节点</Card> → card(CardProps { title:.., sub:x, children:View(..) })
+                // 组件:具名 props(按名匹配、类型由编译器校验)+ children 槽。走 typed builder:
+                // <Card title=.. sub={x}>子节点</Card> → card(CardProps::builder().title(..).sub(x).children(View(..)).build())
+                // 只设提供了的 prop;漏设必填 → build() 不可用(编译错);漏设可选 → 取默认。
                 let f = Ident::new(&to_snake(tag), Span::call_site());
                 let props = Ident::new(&format!("{}Props", tag), Span::call_site());
-                let mut fields: Vec<TS2> = Vec::new();
+                let mut setters: Vec<TS2> = Vec::new();
                 for a in attrs {
                     match a {
                         Attr::Static { name, value } => {
                             let id = Ident::new(name, Span::call_site());
-                            fields.push(quote! { #id: #value.to_string() });
+                            setters.push(quote! { .#id(#value.to_string()) });
                         }
                         Attr::Dyn { name, block } => {
                             let id = Ident::new(name, Span::call_site());
                             let v = unwrap_block(block);
-                            fields.push(quote! { #id: #v });
+                            setters.push(quote! { .#id(#v) });
                         }
                         Attr::Event { .. } | Attr::Bind { .. } | Attr::Ref { .. } => {
                             return quote! { compile_error!("组件属性只支持 名=\"值\" 或 名={表达式};事件 / 绑定 / ref 请在组件内部处理") };
@@ -506,10 +507,12 @@ fn gen_node(n: &Node) -> TS2 {
                 }
                 if !children.is_empty() {
                     let b = emit_branch(children); // 子节点 → 单个 View,作为 children 槽传入
-                    fields.push(quote! { children: rui::View(#b) });
+                    setters.push(quote! { .children(rui::View(#b)) });
                 }
                 return quote! {
-                    crate::view::components::#f(crate::view::components::#props { #(#fields),* }).node()
+                    crate::view::components::#f(
+                        crate::view::components::#props::builder() #(#setters)* .build()
+                    ).node()
                 };
             }
             let astmts: Vec<TS2> = attrs.iter().map(|a| match a {
@@ -616,24 +619,131 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let name = &f.sig.ident;
     let output = &f.sig.output;
     let body = &f.block;
-    let props_name = Ident::new(&format!("{}Props", to_pascal(&name.to_string())), Span::call_site());
-    let mut fields = Vec::new();
-    let mut names = Vec::new();
+    // 组件会被改写成 props 结构体 + builder + fn(Props),泛型 / where 无处安放 → 明确报错而非静默丢弃。
+    if !f.sig.generics.params.is_empty() || f.sig.generics.where_clause.is_some() {
+        return syn::Error::new_spanned(
+            &f.sig.generics,
+            "#[rui::component] 暂不支持泛型 / where 约束(props 走具名结构体 + builder);如需多态请用具体类型或 enum",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let pascal = to_pascal(&name.to_string());
+    let props_name = Ident::new(&format!("{}Props", pascal), Span::call_site());
+    let builder_name = Ident::new(&format!("{}PropsBuilder", pascal), Span::call_site());
+
+    // 收集字段:id / 类型 / 默认表达式(Some = 可选;None = 必填)。可选由 `#[prop(default)]` /
+    // `#[prop(default = <expr>)]` / `#[prop(optional)]` 标注(#[prop] attr 被本宏消费,不会泄漏)。
+    let mut ids: Vec<Ident> = Vec::new();
+    let mut tys: Vec<syn::Type> = Vec::new();
+    let mut defaults: Vec<Option<TS2>> = Vec::new();
     for arg in &f.sig.inputs {
         if let syn::FnArg::Typed(pt) = arg {
             if let syn::Pat::Ident(pi) = &*pt.pat {
-                let id = &pi.ident;
-                let ty = &pt.ty;
-                fields.push(quote! { pub #id: #ty });
-                names.push(id.clone());
+                let mut def: Option<TS2> = None;
+                for attr in &pt.attrs {
+                    if attr.path().is_ident("prop") {
+                        let mut d: TS2 = quote! { ::core::default::Default::default() };
+                        let _ = attr.parse_nested_meta(|meta| {
+                            if meta.path.is_ident("default") {
+                                if meta.input.peek(Token![=]) {
+                                    let v: syn::Expr = meta.value()?.parse()?;
+                                    d = quote! { #v };
+                                }
+                                Ok(())
+                            } else if meta.path.is_ident("optional") {
+                                Ok(())
+                            } else {
+                                Err(meta.error("#[prop] 只支持 default / default = <expr> / optional"))
+                            }
+                        });
+                        def = Some(d);
+                    }
+                }
+                ids.push(pi.ident.clone());
+                tys.push((*pt.ty).clone());
+                defaults.push(def);
             }
         }
     }
+
+    let n = ids.len();
+    // 每字段一个类型参数(builder 状态:Missing → Set<T>)。S0/S1… CamelCase 合法。
+    let snames: Vec<Ident> = (0..n).map(|i| Ident::new(&format!("S{i}"), Span::call_site())).collect();
+    // <...>:空则不带尖括号(零 prop 组件)。
+    let glist = |xs: &[TS2]| -> TS2 {
+        if xs.is_empty() {
+            quote! {}
+        } else {
+            quote! { <#(#xs),*> }
+        }
+    };
+
+    let snames_g = glist(&snames.iter().map(|s| quote! { #s }).collect::<Vec<_>>());
+    let missing_g = glist(&(0..n).map(|_| quote! { rui::props::Missing }).collect::<Vec<_>>());
+    let struct_fields: Vec<TS2> = ids.iter().zip(&tys).map(|(id, ty)| quote! { pub #id: #ty }).collect();
+    let builder_fields: Vec<TS2> = ids.iter().zip(&snames).map(|(id, s)| quote! { #id: #s }).collect();
+    let builder_init: Vec<TS2> = ids.iter().map(|id| quote! { #id: rui::props::Missing }).collect();
+
+    // 每字段一个 setter:字段 i 为 Missing 时可调,调后变 Set<T_i>(其余字段状态不变)。
+    let setters: Vec<TS2> = (0..n)
+        .map(|i| {
+            let id = &ids[i];
+            let ty = &tys[i];
+            let impl_params: Vec<TS2> = (0..n).filter(|&j| j != i).map(|j| { let s = &snames[j]; quote! { #s } }).collect();
+            let impl_g = glist(&impl_params);
+            let self_args: Vec<TS2> = (0..n).map(|j| if j == i { quote! { rui::props::Missing } } else { let s = &snames[j]; quote! { #s } }).collect();
+            let ret_args: Vec<TS2> = (0..n).map(|j| if j == i { quote! { rui::props::Set<#ty> } } else { let s = &snames[j]; quote! { #s } }).collect();
+            let self_g = glist(&self_args);
+            let ret_g = glist(&ret_args);
+            let body_fields: Vec<TS2> = (0..n).map(|j| { let fj = &ids[j]; if j == i { quote! { #fj: rui::props::Set(v) } } else { quote! { #fj: self.#fj } } }).collect();
+            quote! {
+                #[allow(non_snake_case, non_camel_case_types)]
+                impl #impl_g #builder_name #self_g {
+                    #vis fn #id(self, v: #ty) -> #builder_name #ret_g {
+                        #builder_name { #(#body_fields),* }
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // build():必填字段在 Self 类型里固定 Set<T>(漏设 → Missing → 本 impl 不匹配 → build() 不可用);
+    // 可选字段泛型 + OrDefault bound,build 时 or_default(默认值)。
+    let build_impl_params: Vec<TS2> = (0..n).filter(|&j| defaults[j].is_some()).map(|j| { let s = &snames[j]; quote! { #s } }).collect();
+    let build_impl_g = glist(&build_impl_params);
+    let build_self_args: Vec<TS2> = (0..n).map(|j| if defaults[j].is_some() { let s = &snames[j]; quote! { #s } } else { let ty = &tys[j]; quote! { rui::props::Set<#ty> } }).collect();
+    let build_self_g = glist(&build_self_args);
+    let build_wheres: Vec<TS2> = (0..n).filter(|&j| defaults[j].is_some()).map(|j| { let s = &snames[j]; let ty = &tys[j]; quote! { #s: rui::props::OrDefault<#ty> } }).collect();
+    let where_clause = if build_wheres.is_empty() { quote! {} } else { quote! { where #(#build_wheres),* } };
+    let build_field_init: Vec<TS2> = (0..n).map(|j| { let fj = &ids[j]; if let Some(def) = &defaults[j] { quote! { #fj: self.#fj.or_default(|| #def) } } else { quote! { #fj: self.#fj.0 } } }).collect();
+
     quote! {
         #[allow(non_snake_case)]
-        #vis struct #props_name { #(#fields),* }
+        #vis struct #props_name { #(#struct_fields),* }
+
+        #[allow(non_snake_case, non_camel_case_types)]
+        #vis struct #builder_name #snames_g { #(#builder_fields),* }
+
+        impl #props_name {
+            #[allow(non_snake_case)]
+            #vis fn builder() -> #builder_name #missing_g {
+                #builder_name { #(#builder_init),* }
+            }
+        }
+
+        #(#setters)*
+
+        #[allow(non_snake_case, non_camel_case_types)]
+        impl #build_impl_g #builder_name #build_self_g #where_clause {
+            #vis fn build(self) -> #props_name {
+                #props_name { #(#build_field_init),* }
+            }
+        }
+
+        #[allow(non_snake_case)]
         #vis fn #name(__props: #props_name) #output {
-            let #props_name { #(#names),* } = __props;
+            let #props_name { #(#ids),* } = __props;
             #body
         }
     }

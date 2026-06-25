@@ -129,6 +129,7 @@ mod backend {
             pub fn run_js(ptr: *const u8, len: usize); // JS 逃生舱:即发即弃 eval(全局作用域)
             pub fn run_js_on(node: u32, ptr: *const u8, len: usize); // 同上,但 code 里 `el` = 该节点
             pub fn eval_js(ptr: *const u8, len: usize, handler: u32); // eval 取返回(支持 Promise)→ 回调
+            pub fn console_error(ptr: *const u8, len: usize); // console.error(panic hook 用)
         }
     }
 
@@ -294,6 +295,10 @@ mod backend {
     /// 即发即弃执行 JS(全局作用域):写剪贴板 / localStorage.setItem / scrollTo / 调第三方库等。
     pub fn run_js(code: &str) {
         unsafe { ffi::run_js(code.as_ptr(), code.len()) }
+    }
+    /// 打到浏览器 console.error(panic hook 用:wasm panic 默认静默白屏,这里先把消息+位置打出来)。
+    pub fn console_error(msg: &str) {
+        unsafe { ffi::console_error(msg.as_ptr(), msg.len()) }
     }
     /// 在某节点上下文执行 JS:code 里 `el` 绑定到该 DOM 节点(配 node_ref:初始化图表 / 编辑器等)。
     pub fn run_js_on(node: u32, code: &str) {
@@ -626,6 +631,9 @@ mod backend {
                 slot.1 = slot.1.split_whitespace().filter(|c| *c != cls).collect::<Vec<_>>().join(" ");
             }
         });
+    }
+    pub fn console_error(msg: &str) {
+        eprintln!("{msg}"); // 服务端:打到 stderr(native panic 本就会打印,这里仅对称)
     }
     // JS 逃生舱:服务端无 JS 运行时 → 全部 no-op(eval 的回调不触发,与 on_mount 同样只在客户端跑)。
     pub fn run_js(_code: &str) {}

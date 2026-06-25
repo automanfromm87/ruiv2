@@ -110,12 +110,14 @@ const env = {
     try { Promise.resolve((0, eval)(str(p, l))).then(ok).catch(err); }
     catch (e) { err(e); }
   },
+  console_error: (p, l) => console.error(str(p, l)), // panic hook:wasm panic 消息打到 console
 };
 
 const bytes = await fetch("/app.wasm").then((r) => r.arrayBuffer());
 const { instance } = await WebAssembly.instantiate(bytes, { env });
 wasm = instance.exports;
 mem = wasm.memory;
+if (wasm.init) wasm.init(); // 装 panic hook(防静默白屏);渲染前调一次
 
 // 把响应文本写进 wasm 内存,回调 on_fetch(handler)
 function deliver(handler, text) {
