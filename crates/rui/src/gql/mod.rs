@@ -120,6 +120,29 @@ impl ToGqlArg for bool {
     }
 }
 
+// ── SSR 本地 transport(依赖倒置:host 注入"执行一个 query 串 → 响应文本"的实现)──
+// 破除原 dom→server 的**向上循环依赖**:dom 的 SSR 预取(dom::gql/subscribe)原本直接调 crate::server::local_execute,
+// 现改调 crate::gql::fetch;host(server)启动时用 set_transport 注册其 local_execute。gql 只知 fn(&str)->String,
+// 不 NAME 任何 host 模块 → 编译期无 gql→host 边(运行时才注入函数指针)。dom 改为只向下依赖 gql,循环消除。
+#[cfg(not(target_arch = "wasm32"))]
+mod transport {
+    use std::sync::OnceLock;
+    static TRANSPORT: OnceLock<fn(&str) -> String> = OnceLock::new();
+    /// host 启动时注册「同步执行一个 query 串 → 响应文本」的实现(native = server::local_execute)。
+    pub fn set_transport(f: fn(&str) -> String) {
+        let _ = TRANSPORT.set(f);
+    }
+    /// SSR 预取:执行一个 query 串拿响应文本。未注册 transport(如最小骨架 / 测试)→ 返回空数据,不 panic。
+    pub fn fetch(query: &str) -> String {
+        match TRANSPORT.get() {
+            Some(f) => f(query),
+            None => r#"{"data":{},"errors":[]}"#.to_string(),
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport::{fetch, set_transport};
+
 /// 把 transport 回来的响应文本解码成 `Vec<T>`(query!/mutation!/subscription! 共用)。
 /// 兼容两种载荷:标准 `{"data":{root:[...]}}` 与裸数组 `[...]`(回退)。
 pub fn decode_rows<T: FromValue>(text: &str, root: &str) -> Vec<T> {

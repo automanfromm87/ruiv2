@@ -10,12 +10,19 @@
 //! 约定(目录即规范,宏只认这套路径):共享模型 `crate::data::model`、后端 API `crate::api::schema`
 //! (`#[gql_root]`)、视图 `crate::view`(components / layout / pages)、字段 marker `crate::gqlf`(`gql_fields!` 在 crate 根)。
 
-pub mod dom;
-pub mod gql;
+// ── 分层(依赖方向严格向下;由 tests/layering.rs gate 强制,详见 docs/arch.md)──
+// 物理上仍是平铺 mod(modules-with-discipline:不嵌套文件 / 不拆 crate,保持宏的 rui::dom::* 等路径契约 +
+// 零依赖图);层边界靠 layering gate 测试守。将来 kernel 可作为 rui-kernel 单独发布。
+//   L1 kernel  —— 纯响应式内核,零 crate:: 依赖
 pub mod props; // #[component] typed-builder 支持(Missing/Set/OrDefault)
 pub mod reactive;
+//   L2 view/runtime —— 视图树 / 元素模型 / 路由;只向下依赖 L1
+pub mod dom;
 pub mod runtime;
 pub mod view;
+//   L3 data —— GraphQL 值/类型/规范化缓存/执行 + SSR transport 注入点;只向下依赖 L1
+pub mod gql;
+//   L4 host(server / server_axum)在文件下方按 cfg 声明。
 
 pub use view::{node_ref, NodeRef, Page, Strategy, View};
 // 事件:on:<event> 的 handler 内用 `rui::event()` 取当前事件快照(键盘 key/修饰键、鼠标坐标、files 等);

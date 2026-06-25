@@ -606,14 +606,14 @@ mod backend {
     }
     pub fn gql(query: impl AsRef<str>, handler: u32) {
         let q = query.as_ref();
-        let text = crate::server::local_execute(q); // 服务端本地执行同一个 query(SSR 预取)
+        let text = crate::gql::fetch(q); // SSR 预取:经 gql transport(host 注入 local_execute);dom 不再 NAME server(破循环)
         SSR_RESP.with(|r| r.borrow_mut().push((q.to_string(), text.clone()))); // 记录,注入客户端复用
         run_fetch(handler, &text); // 立即回调 → signal 填充 → SSR 渲染带数据
     }
     pub fn subscribe(query: impl AsRef<str>, handler: u32) {
         // SSR 不流式:只解析一次当前值(初值);也记入响应缓存,供客户端水合时同步重建出一致的树。
         let q = query.as_ref();
-        let text = crate::server::local_execute(q);
+        let text = crate::gql::fetch(q);
         SSR_RESP.with(|r| r.borrow_mut().push((q.to_string(), text.clone())));
         run_fetch(handler, &text);
     }
