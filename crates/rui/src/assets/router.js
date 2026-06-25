@@ -113,7 +113,8 @@ const env = {
   console_error: (p, l) => console.error(str(p, l)), // panic hook:wasm panic 消息打到 console
 };
 
-const bytes = await fetch("/app.wasm").then((r) => r.arrayBuffer());
+// wasm 路由可配:默认 /app.wasm;自定义 wasm_route 时 shell 注入 window.__rui_wasm(见 AppConfig::assets)。
+const bytes = await fetch(window.__rui_wasm || "/app.wasm").then((r) => r.arrayBuffer());
 const { instance } = await WebAssembly.instantiate(bytes, { env });
 wasm = instance.exports;
 mem = wasm.memory;

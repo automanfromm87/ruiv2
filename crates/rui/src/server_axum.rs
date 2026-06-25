@@ -10,7 +10,7 @@
 //!   · SSE:应用给的是 std mpsc 广播(阻塞 recv)→ 一根专用 std 线程把它泵进 tokio 通道 → axum 异步事件流。
 
 use crate::gql::exec;
-use crate::server::{page, set_resolver, ROUTER_JS};
+use crate::server::{config, page, set_config, set_resolver, AppConfig};
 use crate::App;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, StatusCode, Uri};
@@ -22,25 +22,33 @@ use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-/// 启动 axum 后端(阻塞,内部自建 tokio 运行时;签名同 std `serve`,应用 main 直接调)。
+/// 启动 axum 后端(零配置;= serve_axum_with(app, AppConfig::default()))。阻塞,内部自建 tokio 运行时。
 pub fn serve_axum(app: App) {
+    serve_axum_with(app, AppConfig::default());
+}
+
+/// 启动 axum 后端并指定宿主配置(bind / 资源路由 / body 上限 / HTML 外壳 / router.js)。与 std serve_with 共享配置。
+pub fn serve_axum_with(app: App, cfg: AppConfig) {
+    set_config(cfg); // 必须在任何 config() 读取前设置(下面 run 里读路由/bind)
     set_resolver(app.resolve); // 同构 SSR 本地预取用同一 resolver
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(run(app));
 }
 
 async fn run(app: App) {
+    let c = config();
+    // 资源路由 / bind / body 上限来自 cfg(可配置宿主);/graphql 端点固定(协议入口)。
     let router = Router::new()
         .route("/graphql", post(graphql)) // POST-only(GET mutation → 405,修了 std 的 method 不校验)
         .route("/graphql/subscribe", get(subscribe))
-        .route("/router.js", get(router_js))
-        .route("/app.wasm", get(app_wasm))
-        .route("/styles.css", get(styles_css))
+        .route(c.assets.router_js_route.as_str(), get(router_js))
+        .route(c.assets.wasm_route.as_str(), get(app_wasm))
+        .route(c.assets.css_route.as_str(), get(styles_css))
         .fallback(ssr)
         .with_state(app)
-        .layer(DefaultBodyLimit::max(1 << 20)); // body 1MB 上限(std 版 body 无上限 → 内存 DoS)
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8084)).await.expect("bind 8084");
-    println!("rui · axum SSR  →  http://127.0.0.1:8084");
+        .layer(DefaultBodyLimit::max(c.body_limit)); // body 上限(默认 1MB;std 版现也强制到 body)
+    let listener = tokio::net::TcpListener::bind((c.bind.0.as_str(), c.bind.1)).await.expect("bind");
+    println!("rui · axum SSR  →  http://{}:{}", c.bind.0, c.bind.1);
     axum::serve(listener, router).with_graceful_shutdown(shutdown()).await.expect("serve");
 }
 
@@ -95,13 +103,14 @@ async fn ssr(State(app): State<App>, uri: Uri) -> impl IntoResponse {
 }
 
 async fn router_js() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], ROUTER_JS)
+    // config() 是 &'static(OnceLock),router_js(Cow)的 as_ref 给出 &'static str,axum 可直接作响应体。
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], config().router_js.as_ref())
 }
 async fn app_wasm() -> impl IntoResponse {
-    static_file("web/app.wasm", "application/wasm")
+    static_file(&config().assets.wasm_disk, "application/wasm")
 }
 async fn styles_css() -> impl IntoResponse {
-    static_file("web/styles.css", "text/css; charset=utf-8")
+    static_file(&config().assets.css_disk, "text/css; charset=utf-8")
 }
 fn static_file(p: &str, ctype: &'static str) -> (StatusCode, [(header::HeaderName, &'static str); 1], Vec<u8>) {
     match std::fs::read(p) {

@@ -53,11 +53,104 @@ pub struct App {
     pub sse: Option<Sse>,
 }
 
-/// 启动 SSR 服务器(阻塞,永不返回)。
+// ── 宿主配置(AppConfig):把宿主级常量从硬编码变成可配置 —— 框架从「自带固定交付方式的模板」变成「引擎」。
+//    进程级 OnceLock(一服务一配置,启动设一次、只读;同 RESOLVE 模式)。所有字段 Default = 当前字面量,
+//    故零配置 serve(app) / serve_axum(app) 行为字节不变;serve_with / serve_axum_with 传自定义。两后端共享同一份配置。
+
+/// 静态资源的路由 + 磁盘路径映射(路由名与磁盘文件名都可改)。
+#[derive(Clone)]
+pub struct AssetMap {
+    pub router_js_route: String, // 默认 "/router.js"(内嵌 glue)
+    pub wasm_route: String,      // 默认 "/app.wasm"
+    pub wasm_disk: String,       // 默认 "web/app.wasm"
+    pub css_route: String,       // 默认 "/styles.css"
+    pub css_disk: String,        // 默认 "web/styles.css"
+}
+impl Default for AssetMap {
+    fn default() -> Self {
+        AssetMap {
+            router_js_route: "/router.js".into(),
+            wasm_route: "/app.wasm".into(),
+            wasm_disk: "web/app.wasm".into(),
+            css_route: "/styles.css".into(),
+            css_disk: "web/styles.css".into(),
+        }
+    }
+}
+
+/// HTML 外壳渲染上下文(默认外壳 default_shell 用;自定义 shell 据此拼整页)。
+pub struct ShellCtx<'a> {
+    pub app_html: &'a str,   // SSR 片段(空 = CSR 空壳)
+    pub data: &'a str,       // 注入的脱水数据 JSON
+    pub css_href: &'a str,   // <link> href(= assets.css_route)
+    pub router_src: &'a str, // <script src>(= assets.router_js_route)
+    pub wasm_route: &'a str, // 客户端 wasm 路由(非默认时注入 window.__rui_wasm 供 router.js 读)
+}
+
+/// 宿主配置。所有字段 Default = 当前行为(零配置 serve 字节不变)。
+pub struct AppConfig {
+    pub bind: (String, u16),                       // 默认 ("127.0.0.1", 8084)
+    pub body_limit: usize,                         // 默认 1<<20(std 现也强制到 body,对齐 axum)
+    pub assets: AssetMap,                          // 静态资源路由/磁盘
+    pub shell: fn(&ShellCtx) -> String,            // 整页 HTML 模板(默认 default_shell)
+    pub router_js: std::borrow::Cow<'static, str>, // /router.js 内容(默认内嵌 ROUTER_JS)
+}
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            bind: ("127.0.0.1".into(), 8084),
+            body_limit: 1 << 20,
+            assets: AssetMap::default(),
+            shell: default_shell,
+            router_js: std::borrow::Cow::Borrowed(ROUTER_JS),
+        }
+    }
+}
+
+static CONFIG: OnceLock<AppConfig> = OnceLock::new();
+/// 当前宿主配置(未经 serve_with 设置则返回默认)。
+pub(crate) fn config() -> &'static AppConfig {
+    CONFIG.get_or_init(AppConfig::default)
+}
+pub(crate) fn set_config(cfg: AppConfig) {
+    let _ = CONFIG.set(cfg); // 启动设一次(serve_with / serve_axum_with);重复设忽略
+}
+
+/// 默认整页骨架(= 原 doc())。css_href / router_src 来自 AssetMap;wasm_route 非默认时注入 window.__rui_wasm
+/// (默认时不注入 → 与历史输出字节一致,router.js 缺省 fallback `/app.wasm`)。
+pub fn default_shell(c: &ShellCtx) -> String {
+    let wasm_inject = if c.wasm_route == "/app.wasm" {
+        String::new()
+    } else {
+        format!("<script>window.__rui_wasm=\"{}\"</script>", c.wasm_route)
+    };
+    format!(
+        "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>rui</title><style>rui-slot,rui-frag{{display:contents}}</style>\
+<link rel=\"stylesheet\" href=\"{css}\"></head>\
+<body><div id=\"app\">{app}</div>\
+<script id=\"__rui_data\" type=\"application/json\">{data}</script>{wasm_inject}\
+<script type=\"module\" src=\"{router}\"></script></body></html>",
+        css = c.css_href,
+        app = c.app_html,
+        data = c.data,
+        router = c.router_src,
+    )
+}
+
+/// 启动 SSR 服务器(零配置;= serve_with(app, AppConfig::default()))。阻塞,永不返回。
 pub fn serve(app: App) {
+    serve_with(app, AppConfig::default());
+}
+
+/// 启动 SSR 服务器并指定宿主配置(bind / 资源路由 / body 上限 / HTML 外壳 / router.js)。
+pub fn serve_with(app: App, cfg: AppConfig) {
+    set_config(cfg); // 必须在任何 config() 读取前设置
     set_resolver(app.resolve); // 让同构 SSR 的本地执行用同一个 resolver
-    let listener = TcpListener::bind(("127.0.0.1", 8084)).expect("bind 8084");
-    println!("rui · SSR  →  http://127.0.0.1:8084");
+    let c = config();
+    let listener = TcpListener::bind((c.bind.0.as_str(), c.bind.1)).expect("bind");
+    println!("rui · SSR  →  http://{}:{}", c.bind.0, c.bind.1);
     for stream in listener.incoming() {
         if let Ok(s) = stream {
             thread::spawn(move || handle(s, app)); // App 是 Copy
@@ -134,7 +227,7 @@ fn render_page(p: crate::view::Page, path: &str, query: &str) -> (String, String
 
 /// 读取完整 HTTP 请求:先读到 headers 结束(\r\n\r\n),再按 Content-Length 补齐 body。
 /// 处理 TCP 分段与大请求体(单次 read 不保证读全)。
-fn read_request(s: &mut TcpStream) -> Vec<u8> {
+fn read_request(s: &mut TcpStream, body_limit: usize) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -145,7 +238,8 @@ fn read_request(s: &mut TcpStream) -> Vec<u8> {
         if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let cl = content_length(&buf[..p]);
             let body_start = p + 4;
-            while buf.len() < body_start + cl {
+            // body 上限(对齐 axum 的 DefaultBodyLimit):只读到 limit,不为超大 Content-Length 无界分配(防内存 DoS)。
+            while buf.len() < body_start + cl && buf.len() <= body_start + body_limit {
                 match s.read(&mut tmp) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => buf.extend_from_slice(&tmp[..n]),
@@ -153,8 +247,8 @@ fn read_request(s: &mut TcpStream) -> Vec<u8> {
             }
             return buf;
         }
-        if buf.len() > 1 << 20 {
-            return buf; // 1MB headers 上限保护
+        if buf.len() > body_limit {
+            return buf; // headers 上限保护(同 body_limit)
         }
     }
 }
@@ -172,7 +266,8 @@ fn content_length(headers: &[u8]) -> usize {
 }
 
 fn handle(mut s: TcpStream, app: App) {
-    let raw = read_request(&mut s);
+    let cfg = config();
+    let raw = read_request(&mut s, cfg.body_limit);
     let req = String::from_utf8_lossy(&raw);
     let target = req.split_whitespace().nth(1).unwrap_or("/");
     // 拆成 pathname + query(fragment 浏览器不会发,稳妥起见也去掉):pathname 走路由匹配 / path 参数,
@@ -202,16 +297,17 @@ fn handle(mut s: TcpStream, app: App) {
 
     // 包 catch_unwind:GraphQL 执行 / SSR 渲染里的 panic 不再静默丢连接,而是回 500 + 打日志。
     // (resolver 的字段级 panic 已在 exec 内隔离成 errors[];这里兜的是渲染期等其它 panic。)
+    // 资源路由 / 磁盘路径 / router.js 内容均来自 cfg(可配置宿主);/graphql 端点固定(协议入口)。
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (&str, &str, Vec<u8>) {
         if path == "/graphql" {
             let q = req.split("\r\n\r\n").nth(1).unwrap_or("");
             ("200 OK", "application/json; charset=utf-8", exec::execute(q, app.resolve).into_bytes())
-        } else if path == "/router.js" {
-            ("200 OK", "text/javascript; charset=utf-8", ROUTER_JS.as_bytes().to_vec())
-        } else if path == "/app.wasm" {
-            file("web/app.wasm", "application/wasm")
-        } else if path == "/styles.css" {
-            file("web/styles.css", "text/css; charset=utf-8")
+        } else if path == cfg.assets.router_js_route {
+            ("200 OK", "text/javascript; charset=utf-8", cfg.router_js.as_bytes().to_vec())
+        } else if path == cfg.assets.wasm_route {
+            file(&cfg.assets.wasm_disk, "application/wasm")
+        } else if path == cfg.assets.css_route {
+            file(&cfg.assets.css_disk, "text/css; charset=utf-8")
         } else {
             ("200 OK", "text/html; charset=utf-8", page(app.route, path, query).into_bytes())
         }
@@ -285,17 +381,16 @@ fn ssr_doc(pg: crate::view::Page, path: &str, query: &str) -> String {
     doc(&app_html, &data)
 }
 
-// 整页 HTML 骨架。app_html 为空 + data 为空 = CSR 空壳。
+// 整页 HTML 骨架(经可配置 shell)。app_html 为空 + data 为空 = CSR 空壳。css/router/wasm 路由来自 AssetMap。
 fn doc(app_html: &str, data: &str) -> String {
-    format!(
-        "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>rui</title><style>rui-slot,rui-frag{{display:contents}}</style>\
-<link rel=\"stylesheet\" href=\"/styles.css\"></head>\
-<body><div id=\"app\">{app_html}</div>\
-<script id=\"__rui_data\" type=\"application/json\">{data}</script>\
-<script type=\"module\" src=\"/router.js\"></script></body></html>"
-    )
+    let cfg = config();
+    (cfg.shell)(&ShellCtx {
+        app_html,
+        data,
+        css_href: &cfg.assets.css_route,
+        router_src: &cfg.assets.router_js_route,
+        wasm_route: &cfg.assets.wasm_route,
+    })
 }
 
 #[cfg(test)]
@@ -381,5 +476,53 @@ mod runtime_isolation_tests {
                 "退出内层后外层 store 被 RAII 还原为 outer(未被内层污染)"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    // #5 可配置宿主:默认 shell 与历史 doc() 字节一致(零配置不回归 + 两后端共用此 shell = parity);自定义生效。
+    use super::{default_shell, AppConfig, AssetMap, ShellCtx};
+
+    fn shell_with(a: &AssetMap, app: &str, data: &str) -> String {
+        default_shell(&ShellCtx {
+            app_html: app,
+            data,
+            css_href: &a.css_route,
+            router_src: &a.router_js_route,
+            wasm_route: &a.wasm_route,
+        })
+    }
+
+    #[test]
+    fn default_shell_byte_identical_to_legacy() {
+        let html = shell_with(&AssetMap::default(), "<p>x</p>", "{\"q\":1}");
+        let expected = "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>rui</title><style>rui-slot,rui-frag{display:contents}</style>\
+<link rel=\"stylesheet\" href=\"/styles.css\"></head>\
+<body><div id=\"app\"><p>x</p></div>\
+<script id=\"__rui_data\" type=\"application/json\">{\"q\":1}</script>\
+<script type=\"module\" src=\"/router.js\"></script></body></html>";
+        assert_eq!(html, expected, "默认 shell 与历史 doc() 字节不一致(零配置回归)");
+        assert!(!html.contains("__rui_wasm"), "默认 wasm 路由不应注入全局(保字节一致)");
+    }
+
+    #[test]
+    fn custom_config_honored() {
+        let a = AssetMap {
+            css_route: "/assets/app.css".into(),
+            router_js_route: "/static/glue.js".into(),
+            wasm_route: "/static/app.wasm".into(),
+            ..AssetMap::default()
+        };
+        let html = shell_with(&a, "", "");
+        assert!(html.contains("href=\"/assets/app.css\""), "自定义 css 路由应进 <link>");
+        assert!(html.contains("src=\"/static/glue.js\""), "自定义 router 路由应进 <script>");
+        assert!(html.contains("window.__rui_wasm=\"/static/app.wasm\""), "非默认 wasm 路由应注入全局供 router.js 读");
+        // 默认字面量回归(bind / body_limit)
+        let d = AppConfig::default();
+        assert_eq!(d.bind, ("127.0.0.1".to_string(), 8084));
+        assert_eq!(d.body_limit, 1 << 20);
     }
 }
