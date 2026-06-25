@@ -6,3 +6,11 @@ fn macro_rejection_contracts() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/fail/*.rs");
 }
+
+/// 宏「正向契约」:这些用法必须**编译通过**。当前守 #2 的目录解耦 —— rui::app! 用非默认路径
+/// 映射 registry 四键,证明宏不再绑死固定目录(Phase C 改 emission 后这条仍须绿)。
+#[test]
+fn macro_pass_contracts() {
+    let t = trybuild::TestCases::new();
+    t.pass("tests/pass/*.rs");
+}

@@ -54,8 +54,8 @@ pub use server_axum::serve_axum;
 
 // 宏:应用直接用 rui::view! / rui::query! / #[derive(rui::GqlObject)] / #[rui::gql_root(..)] 等。
 pub use rui_macros::{
-    component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource, router,
-    subscription, view, GqlObject,
+    app, component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource,
+    router, subscription, view, GqlObject,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

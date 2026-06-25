@@ -2,11 +2,15 @@
 //!
 //! 语法:
 //!   <div class="x" style={expr} on:click={move || ...}> 子节点 </div>   元素 / 静态属性 / 表达式属性 / 事件
-//!   <StatCard label="x" value={v} />                                    组件(首字母大写 → 调 crate::view::components::snake)
+//!   <StatCard label="x" value={v} />                                    组件(首字母大写 → 调 registry components::snake)
 //!   <For list=rows item=r> <tr>...{ &r.symbol }...</tr> </For>          响应式列表(list 为 signal,变则重建)
 //!   "文本" / { expr }(静态) / { move || expr }(响应式文本)
 //!
 //! 另含 GraphQL data 层宏:gql_schema! / gql_fields! / #[derive(GqlObject)] / query! / mutation! / subscription!
+//!
+//! 目录解耦:宏不再硬编码 crate::view::components / crate::data::model / crate::api::schema / crate::gqlf,
+//! 而是统一引用 `crate::__rui_registry::{components,model,schema,fields}` 这层 re-export 间接。应用在 crate 根
+//! 调一次 `rui::app! { .. }` 把四个键映射到实际路径(缺省走旧约定,也可指向别的目录甚至别的 crate)。
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TS2};
 use quote::quote;
@@ -14,6 +18,75 @@ use syn::ext::IdentExt; // Ident::parse_any:把 `type` / `for` 等关键字也�
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Data, DeriveInput, Expr, Fields, Ident, LitInt, LitStr, Stmt, Token, Type};
+
+// ───────────────────────── rui::app!(应用 registry:解耦宏与目录结构)─────────────────────────
+// 宏不再硬编码 crate::view::components / crate::data::model / crate::api::schema / crate::gqlf,而是统一引用
+// 一个 re-export 间接层 `crate::__rui_registry::{components,model,schema,fields}`。app! 在 crate 根调用一次,
+// 把这四个键映射到应用实际的模块路径(缺省走旧约定):
+//   rui::app! {}                                              // 全用默认约定
+//   rui::app! { components = crate::ui::widgets, schema = crate::gql::roots }  // 自定义目录
+//   rui::app! { model = ::shared_types::model }               // 跨 crate(多 package / 多 domain)
+// 路径解析在所有宏展开**之后**发生,故 re-export 模块与消费宏的展开顺序无关(paths resolve late)。
+// 必须调用一次:否则消费宏引用的 crate::__rui_registry 不存在 → "unresolved module" 编译错。
+struct AppRegistry {
+    components: syn::Path,
+    model: syn::Path,
+    schema: syn::Path,
+    fields: syn::Path,
+}
+impl Parse for AppRegistry {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let (mut components, mut model, mut schema, mut fields) = (None, None, None, None);
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let path: syn::Path = input.parse()?;
+            match key.to_string().as_str() {
+                "components" => components = Some(path),
+                "model" => model = Some(path),
+                "schema" => schema = Some(path),
+                "fields" => fields = Some(path),
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("rui::app! 未知键 `{other}`(支持 components / model / schema / fields)"),
+                    ))
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        let dflt = |s: &str| syn::parse_str::<syn::Path>(s).expect("默认路径合法");
+        Ok(AppRegistry {
+            components: components.unwrap_or_else(|| dflt("crate::view::components")),
+            model: model.unwrap_or_else(|| dflt("crate::data::model")),
+            schema: schema.unwrap_or_else(|| dflt("crate::api::schema")),
+            fields: fields.unwrap_or_else(|| dflt("crate::gqlf")),
+        })
+    }
+}
+
+#[proc_macro]
+pub fn app(input: TokenStream) -> TokenStream {
+    let r = syn::parse_macro_input!(input as AppRegistry);
+    let (c, m, s, f) = (r.components, r.model, r.schema, r.fields);
+    // re-export 间接层:消费宏统一引用 crate::__rui_registry::{components,model,schema,fields}。
+    // pub use 零成本、类型透明(Field<gqlf::X> 仍解析到同一真实类型 → 编译期 exact-fit 校验不变)。
+    quote! {
+        #[doc(hidden)]
+        #[allow(unused_imports)]
+        pub(crate) mod __rui_registry {
+            // pub(crate):消费宏只在本 crate 内引用 crate::__rui_registry,故无需对外 pub
+            //(也避开"经私有模块 pub 再导出"的可见性坑;跨 crate 场景下各 crate 有自己的 registry)。
+            pub(crate) use #c as components;
+            pub(crate) use #m as model;
+            pub(crate) use #s as schema;
+            pub(crate) use #f as fields;
+        }
+    }
+    .into()
+}
 
 enum Node {
     El { tag: String, attrs: Vec<Attr>, children: Vec<Node> },
@@ -510,8 +583,8 @@ fn gen_node(n: &Node) -> TS2 {
                     setters.push(quote! { .children(rui::View(#b)) });
                 }
                 return quote! {
-                    crate::view::components::#f(
-                        crate::view::components::#props::builder() #(#setters)* .build()
+                    crate::__rui_registry::components::#f(
+                        crate::__rui_registry::components::#props::builder() #(#setters)* .build()
                     ).node()
                 };
             }
@@ -1127,11 +1200,11 @@ pub fn gql_schema(input: TokenStream) -> TokenStream {
             let m = &f.name;
             let ty = &f.ty;
             let tyq = if f.is_list {
-                quote! { Vec<crate::data::model::#ty> }
+                quote! { Vec<crate::__rui_registry::model::#ty> }
             } else {
-                quote! { crate::data::model::#ty }
+                quote! { crate::__rui_registry::model::#ty }
             };
-            quote! { impl rui::gql::Field<crate::gqlf::#m> for #root { type Ty = #tyq; } }
+            quote! { impl rui::gql::Field<crate::__rui_registry::fields::#m> for #root { type Ty = #tyq; } }
         });
         out.extend(quote! {
             #[allow(non_camel_case_types, dead_code)]
@@ -1337,10 +1410,10 @@ fn gen_sel_struct(
         let key = field.to_string(); // 响应里的 key(服务端按别名返回)
         if s.children.is_empty() {
             defs.push(quote! {
-                pub #field: <<#elem_ty as rui::gql::Field<crate::gqlf::#real>>::Ty as rui::gql::Scalar>::Out,
+                pub #field: <<#elem_ty as rui::gql::Field<crate::__rui_registry::fields::#real>>::Ty as rui::gql::Scalar>::Out,
             });
         } else {
-            let orig = quote! { <#elem_ty as rui::gql::Field<crate::gqlf::#real>>::Ty };
+            let orig = quote! { <#elem_ty as rui::gql::Field<crate::__rui_registry::fields::#real>>::Ty };
             let child_elem = quote! { <#orig as rui::gql::GqlElem>::Elem };
             let child = gen_sel_struct(child_elem, &s.children, counter, structs, prefix);
             defs.push(quote! { pub #field: <#orig as rui::gql::Reshape<#child>>::Out, });
@@ -1370,10 +1443,10 @@ fn mutation_checks(elem: TS2, sels: &[Sel], out: &mut Vec<TS2>) {
         let f = &s.name;
         if s.children.is_empty() {
             out.push(quote! {
-                let _ = ::core::marker::PhantomData::<<#elem as rui::gql::Field<crate::gqlf::#f>>::Ty>;
+                let _ = ::core::marker::PhantomData::<<#elem as rui::gql::Field<crate::__rui_registry::fields::#f>>::Ty>;
             });
         } else {
-            let orig = quote! { <#elem as rui::gql::Field<crate::gqlf::#f>>::Ty };
+            let orig = quote! { <#elem as rui::gql::Field<crate::__rui_registry::fields::#f>>::Ty };
             let child = quote! { <#orig as rui::gql::GqlElem>::Elem };
             out.push(quote! { let _ = ::core::marker::PhantomData::<#child>; });
             mutation_checks(child, &s.children, out);
@@ -1398,7 +1471,7 @@ fn expand_fetch(root: &Ident, args: &[(String, ArgVal)], sel: &[Sel], kind: Fetc
     let mut counter = 0usize;
     let mut structs = Vec::new();
     let elem0 = quote! {
-        <<crate::api::schema::#root_root as rui::gql::Field<crate::gqlf::#root>>::Ty as rui::gql::GqlElem>::Elem
+        <<crate::__rui_registry::schema::#root_root as rui::gql::Field<crate::__rui_registry::fields::#root>>::Ty as rui::gql::GqlElem>::Elem
     };
     let row = gen_sel_struct(elem0, sel, &mut counter, &mut structs, "__Row");
     let roots = root.to_string();
@@ -1590,7 +1663,7 @@ pub fn mutation(input: TokenStream) -> TokenStream {
     let root_args = emit_args(&m.args); // 运行时拼参数(支持变量,经 ToGqlArg 转义)
     // 编译期字段校验:每个所选标量字段必须存在于 mutation 根返回的元素类型上。
     let elem = quote! {
-        <<crate::api::schema::MutationRoot as rui::gql::Field<crate::gqlf::#root>>::Ty as rui::gql::GqlElem>::Elem
+        <<crate::__rui_registry::schema::MutationRoot as rui::gql::Field<crate::__rui_registry::fields::#root>>::Ty as rui::gql::GqlElem>::Elem
     };
     let mut checks = Vec::new();
     mutation_checks(elem, &m.sel, &mut checks);
@@ -1688,8 +1761,8 @@ pub fn fragment(input: TokenStream) -> TokenStream {
     let prefix = format!("__{}_", name);
     let mut counter = 0usize;
     let mut structs = Vec::new();
-    // 片段在 Type(约定在 crate::data::model)上做 exact-fit 校验 —— 字段不存在 / 类型错 → cargo build 报错。
-    let elem = quote! { crate::data::model::#ty };
+    // 片段在 Type(经 app! registry 的 model,默认 crate::data::model)上做 exact-fit 校验 —— 字段不存在 / 类型错 → cargo build 报错。
+    let elem = quote! { crate::__rui_registry::model::#ty };
     let row = gen_sel_struct(elem, &f.sel, &mut counter, &mut structs, &prefix);
     let selection = sel_to_string(&f.sel);
     quote! {
@@ -1747,13 +1820,13 @@ pub fn paginated(input: TokenStream) -> TokenStream {
 
     // 类型导航:QueryRoot.root → Connection;Connection.edges → Edge;Edge.node → node 元素类型。
     let conn_elem = quote! {
-        <<crate::api::schema::QueryRoot as rui::gql::Field<crate::gqlf::#root>>::Ty as rui::gql::GqlElem>::Elem
+        <<crate::__rui_registry::schema::QueryRoot as rui::gql::Field<crate::__rui_registry::fields::#root>>::Ty as rui::gql::GqlElem>::Elem
     };
     let edge_elem = quote! {
-        <<#conn_elem as rui::gql::Field<crate::gqlf::edges>>::Ty as rui::gql::GqlElem>::Elem
+        <<#conn_elem as rui::gql::Field<crate::__rui_registry::fields::edges>>::Ty as rui::gql::GqlElem>::Elem
     };
     let node_elem = quote! {
-        <<#edge_elem as rui::gql::Field<crate::gqlf::node>>::Ty as rui::gql::GqlElem>::Elem
+        <<#edge_elem as rui::gql::Field<crate::__rui_registry::fields::node>>::Ty as rui::gql::GqlElem>::Elem
     };
 
     let mut counter = 0usize;
@@ -1768,7 +1841,7 @@ pub fn paginated(input: TokenStream) -> TokenStream {
         #[derive(Clone, PartialEq)]
         struct #edge_row {
             node: #node_row,
-            cursor: <<#edge_elem as rui::gql::Field<crate::gqlf::cursor>>::Ty as rui::gql::Scalar>::Out,
+            cursor: <<#edge_elem as rui::gql::Field<crate::__rui_registry::fields::cursor>>::Ty as rui::gql::Scalar>::Out,
         }
         impl rui::gql::FromValue for #edge_row {
             fn from_value(v: &rui::gql::Value) -> Self {
@@ -1918,7 +1991,7 @@ pub fn derive_gql_object(input: TokenStream) -> TokenStream {
     let types: Vec<&Type> = fields.iter().map(|f| &f.ty).collect();
 
     let field_impls = idents.iter().zip(types.iter()).map(|(id, ty)| {
-        quote! { impl rui::gql::Field<crate::gqlf::#id> for #name { type Ty = #ty; } }
+        quote! { impl rui::gql::Field<crate::__rui_registry::fields::#id> for #name { type Ty = #ty; } }
     });
     let field_arms = idents.iter().zip(names.iter()).map(|(id, nm)| {
         quote! { #nm => Some(rui::gql::IntoValue::into_value(&self.#id)), }
@@ -2002,7 +2075,7 @@ pub fn gql_root(attr: TokenStream, item: TokenStream) -> TokenStream {
                 syn::ReturnType::Default => quote! { () },
             };
             field_impls.push(quote! {
-                impl rui::gql::Field<crate::gqlf::#mname> for #root { type Ty = #ret; }
+                impl rui::gql::Field<crate::__rui_registry::fields::#mname> for #root { type Ty = #ret; }
             });
             // 参数(跳过 &self)→ 从 args 按类型提取。
             let mut extracts = Vec::new();

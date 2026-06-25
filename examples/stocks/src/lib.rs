@@ -7,6 +7,10 @@ pub mod api;
 pub mod data;
 mod view;
 
+// app registry:把宏依赖的四个逻辑模块映射到本应用的实际路径(此处全用默认约定;改目录 / 跨 crate 时在此覆盖)。
+// 宏不再硬编码 crate::view::components 等,而是统一引用 crate::__rui_registry::{components,model,schema,fields}。
+rui::app! {}
+
 // 字段 marker:gql_root 为每个方法生成 Field<gqlf::方法名>,故所有 query/mutation/subscription 字段名 + 数据字段都要在此声明。
 rui::gql_fields!(
     id, text, done, todos, todo_page, search, detail, add_todo, toggle_todo, remove_todo, clear_done, complete_all,
