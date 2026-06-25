@@ -145,8 +145,8 @@ pub(crate) fn set_config(cfg: AppConfig) {
 /// 默认整页骨架。css_href / router_src 进 <link>/<script src>(服务端链接);wasm/graphql/subscribe 路由统一注入
 /// `window.__rui` 供客户端 router.js 读 —— 宿主入口(协议 + 资源)单一真相源贯穿两端,不再有客户端硬编码地址。
 pub fn default_shell(c: &ShellCtx) -> String {
-    // 转义 `\` / `"` / `</`:防路由串破坏 <script> 字符串或提前闭合标签。
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace("</", "<\\/");
+    // 转义 `\` / `"`(复用 gql::gql_escape)+ `</`(防提前闭合 <script>):防路由串破坏注入的脚本。
+    let esc = |s: &str| crate::gql::gql_escape(s).replace("</", "<\\/");
     let rui_cfg = format!(
         "<script>window.__rui={{wasm:\"{}\",graphql:\"{}\",subscribe:\"{}\"}}</script>",
         esc(c.wasm_route),
