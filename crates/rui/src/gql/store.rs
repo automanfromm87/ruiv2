@@ -351,4 +351,86 @@ mod tests {
         assert_eq!(order.field("items").as_list()[0].field("qty").as_i64(), 99);
         reset();
     }
+
+    // ───────────────── 架构不变量回归(Phase A 安全网)─────────────────
+    // 守住框架核心语义契约:任一失败 = 某次重构破坏了不变量(而非普通功能点)。
+
+    #[test]
+    fn inv2_reset_isolates_requests() {
+        // INV-2(SSR 请求隔离):render_page 每渲染前 reset() 清 ENTITIES+VERSIONS,
+        // 故复用线程(axum spawn_blocking 池)上请求 N+1 看不到请求 N 的数据,不靠"每连接一线程"的偶然。
+        // 强制来源:gql/store.rs:262 reset() · server.rs render_page 调用链。
+        reset();
+        normalize_list(&parse(r#"[{"__typename":"Todo","__id":"1","text":"req-N"}]"#));
+        assert!(read_entity("Todo:1").is_some(), "写入后应可见");
+        assert!(version("Todo:1").get() >= 1, "写入应已 bump 版本");
+        reset(); // 模拟下一次渲染前清理
+        assert!(read_entity("Todo:1").is_none(), "reset 后上一请求的 entity 必须不可见(请求隔离)");
+        assert_eq!(version("Todo:1").get(), 0, "reset 后新建版本从 0 起(VERSIONS 已清)");
+        reset();
+    }
+
+    #[test]
+    fn inv3_merge_then_bump() {
+        // INV-3(先合并后 bump):merge_all 把整批 entity 全部并入 store 后才 bump,
+        // 故被唤醒的视图只会看到"全部合并完"的一致快照,绝不读到半合并中间态。
+        // 强制来源:gql/store.rs:8-9 注释 · merge_all:105-117(只 bump 嵌套 touched,顶层留给调用方)· normalize_list:127-131。
+        reset();
+        // (a) merge_all 不 bump 顶层 entity 版本(无嵌套 → 完全不 bump)
+        let before = version("Todo:1").get();
+        merge_all(&parse(r#"[{"__typename":"Todo","__id":"1","text":"x"}]"#));
+        assert_eq!(version("Todo:1").get(), before, "merge_all 不得 bump 顶层版本(由调用方 bump)");
+        // (b) normalize_list(= merge_all + 调用方 bump)才 bump 一次顶层
+        normalize_list(&parse(r#"[{"__typename":"Todo","__id":"1","text":"y"}]"#));
+        assert_eq!(version("Todo:1").get(), before + 1, "normalize_list 应 bump 一次顶层版本");
+        // (c) "先合并后 bump" 的可观测保证:订阅 Order 视图(透传读 Item)被唤醒时整批已合并 → 看到 Item 新值
+        reset();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(-1i64));
+        let s = seen.clone();
+        let (_, _guard) = crate::reactive::scope(move || {
+            crate::reactive::effect(move || {
+                if let Some(o) = read_entity("Order:1") {
+                    s.set(o.field("items").as_list().first().map(|i| i.field("qty").as_i64()).unwrap_or(-1));
+                }
+            });
+        });
+        // 一批里同时含 Order:1 与它引用的 Item:A:merge_all 把两者全并入后才 bump Order:1
+        normalize_list(&parse(
+            r#"[{"__typename":"Order","__id":"1","items":[{"__typename":"Item","__id":"A","qty":7}]}]"#,
+        ));
+        assert_eq!(seen.get(), 7, "视图被唤醒时应看到完整合并快照(嵌套 Item:A 已并入,无半合并)");
+        reset();
+    }
+
+    #[test]
+    fn inv4_error_response_does_not_pollute_cache() {
+        // INV-4(错误不污染缓存):query!/resource!/subscription! 对每个响应跑 errors_message —
+        // 失败(Some)→ 跳过 merge_all 保留上次 good 值;成功(None)→ merge。即便错误响应"夹带" entity 也不得写入。
+        // 强制来源:rui-macros lib.rs:1445/1485(errors_message().is_some() → 跳过 merge)· gql/value.rs:126 errors_message。
+        use crate::gql::value::errors_message;
+        // 复刻宏的 merge 决策:payload 取 data.todo 列表
+        let apply = |resp: &Value| {
+            if errors_message(resp).is_some() {
+                return; // 失败 → 跳过 merge(契约)
+            }
+            normalize_list(resp.field("data").field("todo"));
+        };
+        reset();
+        apply(&parse(r#"{"data":{"todo":[{"__typename":"Todo","__id":"1","text":"good"}]},"errors":[]}"#));
+        assert_eq!(read_entity("Todo:1").unwrap().field("text").as_str(), "good");
+        let v = version("Todo:1").get();
+        // 纯错误响应(无 data)→ 跳过,缓存与版本不变
+        apply(&parse(r#"{"data":null,"errors":[{"message":"boom"}]}"#));
+        assert_eq!(read_entity("Todo:1").unwrap().field("text").as_str(), "good", "错误响应不得改动已缓存 entity");
+        assert_eq!(version("Todo:1").get(), v, "错误响应不得 bump 版本");
+        // 带 errors 又"夹带" entity 的响应 → 仍因 errors 非空被整体跳过(不污染)
+        apply(&parse(
+            r#"{"data":{"todo":[{"__typename":"Todo","__id":"1","text":"EVIL"}]},"errors":[{"message":"x"}]}"#,
+        ));
+        assert_eq!(read_entity("Todo:1").unwrap().field("text").as_str(), "good", "带 errors 的响应即使含 entity 也不得写入缓存");
+        // good 响应才覆盖
+        apply(&parse(r#"{"data":{"todo":[{"__typename":"Todo","__id":"1","text":"newer"}]},"errors":[]}"#));
+        assert_eq!(read_entity("Todo:1").unwrap().field("text").as_str(), "newer");
+        reset();
+    }
 }

@@ -9,6 +9,7 @@ async function fresh() {
   let memory;
   let root = 0;
   let clearAppCalls = 0; // SPA 换页才 clear_app;同页换参数不应触发(据此验证"不重建")
+  let creates = 0; // create_element/create_text 计数 → 同页换参数应为 0 新建(INV-1 直接证明页面体未重跑)
   const focused = []; // on_mount 命令式聚焦记录
   const intervals = []; // set_interval 记录({ms,h})
   const timeouts = []; // set_timeout 记录({ms,h})—— 过渡的延时移除,测试手动触发
@@ -20,8 +21,8 @@ async function fresh() {
   const reg = (node) => (nodes.push(node), nodes.length - 1);
   const detach = (id) => { for (const n of nodes) if (n && n.children) { const i = n.children.indexOf(id); if (i >= 0) n.children.splice(i, 1); } };
   const env = {
-    create_element: (p, l) => reg({ tag: str(p, l), attrs: {}, children: [], text: null }),
-    create_text: (p, l) => reg({ tag: "#text", text: str(p, l), children: [] }),
+    create_element: (p, l) => (creates++, reg({ tag: str(p, l), attrs: {}, children: [], text: null })),
+    create_text: (p, l) => (creates++, reg({ tag: "#text", text: str(p, l), children: [] })),
     claim_element: () => 0,
     claim_text: () => 0,
     set_text: (id, p, l) => { nodes[id].text = str(p, l); },
@@ -109,7 +110,7 @@ async function fresh() {
   const runInterval = (h) => X.run_interval(h); // 手动触发一次定时器回调
   // eval 结果回传:首字节 \x00=ok / \x01=err(与 router.js eval_js 一致)
   const evalReturn = (codeSub, result, okFlag = true) => { const e = evals.find((x) => x.code.includes(codeSub)); const [p, l] = write((okFlag ? "\x00" : "\x01") + result); X.on_fetch(e.handler, p, l); };
-  return { X, render, navigate, onFetch, fire, fireEvent, fetchFor, countFor, feed, texts, has, liveHas, hasAttr, anyChecked, anyClass, runTimeouts, liCount, runInterval, evalReturn, focused, intervals, timeouts, cleared, jsRun, evals, get fetchReq() { return fetchReq; }, get clearAppCalls() { return clearAppCalls; } };
+  return { X, render, navigate, onFetch, fire, fireEvent, fetchFor, countFor, feed, texts, has, liveHas, hasAttr, anyChecked, anyClass, runTimeouts, liCount, runInterval, evalReturn, focused, intervals, timeouts, cleared, jsRun, evals, get fetchReq() { return fetchReq; }, get clearAppCalls() { return clearAppCalls; }, get creates() { return creates; } };
 }
 
 let ok = true;
@@ -227,16 +228,23 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   check(f.has("第一条待办"), "/todo/1   详情渲染(第一条待办)");
 
   // 同页换参数:导航到 /todo/2 —— key 相同 → 不 clear_app(页面不重建),只 param 变 → resource! 重取
+  const detailMounts = () => f.evals.filter((e) => e.code.includes("navigator.language")).length;
   const before = f.clearAppCalls;
+  const mountsBefore = detailMounts(); // detail 页 on_mount(eval navigator.language)= 页面体执行一次的"once"副作用
   f.navigate("/todo/2");
   check(f.clearAppCalls === before, "/todo/2   同页换参数:未 clear_app(页面不重建)");
+  // INV-1 直接断言:页面体的 on_mount-once 副作用未再触发 → 页面体未重新执行(真·不重建,非仅"未 clear_app"的代理)。
+  // 注:内层 reactive_block 因 resource! 进 loading 态会增 create_element,那是细粒度更新、不算页面体重跑。
+  check(detailMounts() === mountsBefore, `/todo/2   同页换参数:页面体未重新执行(detail on_mount 未再触发),${mountsBefore}→${detailMounts()}`);
   check(!!f.fetchFor('detail(id: "2")'), "/todo/2   param signal 变 → resource! 重取 detail(id=2)");
   f.feed('detail(id: "2")', '{"data":{"detail":[{"__typename":"Todo","__id":"2","id":"2","text":"第二条待办","done":false}]}}');
   check(f.has("第二条待办"), "/todo/2   重取后内容原地更新(第二条待办)");
 
   // 换页:导航到 /archive —— key 不同 → clear_app 一次(整页重建)
+  const createsBeforeCross = f.creates;
   f.navigate("/archive");
   check(f.clearAppCalls === before + 1, "/archive  换页(key 不同)→ clear_app 重建一次");
+  check(f.creates > createsBeforeCross, "/archive  换页:有新建节点(整页重建)—— 与同页零新建形成 INV-1 对照");
   check(f.has("归档"), "/archive  换页后新页渲染");
 }
 
@@ -301,6 +309,18 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   check(f.has("⏱ 1s"), "/         interval tick → 时钟 reactive 更新(1s)");
   f.navigate("/about"); // 换页(不同 key)→ scope dispose
   check(f.cleared.length > 0, "/about    换页 → on_cleanup → clear_interval(定时器不泄漏)");
+}
+
+// 14b) INV-5:on_mount 在「动态重建」后仍运行 —— 点 ✎ 动态显示的编辑输入子树(GreetingBadge,reactive_block
+//   事件中重建)其 on_mount→focus 必须经 dispatch 尾部 flush_mounts 跑到(否则只在首屏静态渲染时挂载)。
+//   强制来源:runtime.rs flush_mounts + client! 在 dispatch 尾部调它。
+{
+  const f = await fresh();
+  f.render("/");
+  f.onFetch(TODOS);
+  const focusedBefore = f.focused.length; // 首屏 AddForm on_mount 已聚焦一次(静态子树)
+  f.fire(9); // 点 ✎ 进入编辑(动态显示带 on_mount 聚焦的编辑输入子树)
+  check(f.focused.length === focusedBefore + 1, `/         INV-5 动态子树 on_mount 在 dispatch 后运行(编辑框聚焦),focused ${focusedBefore}→${f.focused.length}`);
 }
 
 // 15) 嵌套路由组:/dash ↔ /dash/settings 共享 dash_shell(同组 key 不重建,outlet 按 path 换内容)

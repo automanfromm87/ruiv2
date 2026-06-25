@@ -421,3 +421,23 @@ macro_rules! client {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::matches;
+
+    #[test]
+    fn inv1_route_identity_param_vs_crosspage() {
+        // INV-1(同页导航不重建)的路由半边:/todo/1 与 /todo/2 都匹配同一模式 "/todo/:id"
+        // → 解析到同一页 → CUR_KEY 相同 → navigate 走 same 分支(不 clear_app、不重建,只更新 param signal)。
+        // 强制来源:runtime.rs:48 matches() · runtime.rs:254 CUR_KEY 比较。整体不重建行为由 verify.mjs section 8 守。
+        assert!(matches("/todo/:id", "/todo/1"));
+        assert!(matches("/todo/:id", "/todo/2")); // 同模式 → 同页身份 → 同 key → 不重建
+        assert!(!matches("/todo/:id", "/archive")); // 段不匹配 → 换页
+        assert!(!matches("/todo/:id", "/todo/1/x")); // 段数不同 → 不匹配
+        assert!(matches("/", "/")); // 根
+        assert!(matches("/dash/settings", "/dash/settings")); // 多段字面量
+        assert!(!matches("/dash/settings", "/dash")); // 段数不同
+        assert!(matches("/dash/:tab/:id", "/dash/a/1")); // 多 param 段
+    }
+}
