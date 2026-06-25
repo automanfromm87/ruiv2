@@ -831,11 +831,13 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
 struct PageAttr {
     strategy: TS2,
     pattern: String,
+    name: Option<String>, // 可选显式 RouteId(身份与 URL 解耦:如同模式两套策略,或想跨模式变更保持同 key)
 }
 impl Parse for PageAttr {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut strategy = quote! { rui::Strategy::Ssr };
         let mut pattern = String::new();
+        let mut name = None;
         while !input.is_empty() {
             if input.peek(LitStr) {
                 pattern = input.parse::<LitStr>()?.value(); // 路由模式串,如 "/todo/:id"
@@ -847,10 +849,14 @@ impl Parse for PageAttr {
                 match id.to_string().as_str() {
                     "ssr" => strategy = quote! { rui::Strategy::Ssr },
                     "csr" => strategy = quote! { rui::Strategy::Csr },
+                    "name" => {
+                        input.parse::<Token![=]>()?;
+                        name = Some(input.parse::<LitStr>()?.value()); // name = "todo_detail"
+                    }
                     other => {
                         return Err(syn::Error::new(
                             id.span(),
-                            format!("#[rui::page] 只支持 ssr / csr / static + 可选路由模式串,收到 `{other}`"),
+                            format!("#[rui::page] 只支持 ssr / csr / static / name=\"..\" + 可选路由模式串,收到 `{other}`"),
                         ))
                     }
                 }
@@ -859,16 +865,23 @@ impl Parse for PageAttr {
                 input.parse::<Token![,]>()?;
             }
         }
-        Ok(PageAttr { strategy, pattern })
+        Ok(PageAttr { strategy, pattern, name })
     }
 }
 
 #[proc_macro_attribute]
 pub fn page(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let PageAttr { strategy: strat, pattern } = syn::parse_macro_input!(attr as PageAttr);
+    let PageAttr { strategy: strat, pattern, name: route_name } = syn::parse_macro_input!(attr as PageAttr);
     let f = syn::parse_macro_input!(item as syn::ItemFn);
     let vis = &f.vis;
     let name = &f.sig.ident;
+    // 稳定 RouteId(取代 module_path!()):显式 name 优先;否则用路由模式串(顶层页即全路径,稳定、可读、跨重命名/跨 crate 不变);
+    // 二者皆无(罕见的无模式页)才回退 module_path!() 以保唯一身份。组成员的 key 由 router! 的组接管(此 key 被丢弃)。
+    let route_id = match &route_name {
+        Some(n) => quote! { #n },
+        None if !pattern.is_empty() => quote! { #pattern },
+        None => quote! { module_path!() },
+    };
     let attrs = &f.attrs; // 转发到生成的 fn(保留 #[doc] / #[cfg] / #[allow] 等)
     let body = &f.block; // 原函数体,返回 View
 
@@ -951,8 +964,9 @@ pub fn page(attr: TokenStream, item: TokenStream) -> TokenStream {
         #vis const __RUI_STRATEGY: rui::Strategy = #strat;
         #(#attrs)*
         #vis fn #name() -> rui::Page {
-            // key = 页面模块路径:同一页(不同参数)key 相同,不同页 key 不同 → 导航时据此判断重建 or 仅换参数。
-            rui::Page::new(module_path!(), #strat, move || {
+            // key = 稳定 RouteId(显式 name / 路由模式;见上)。同一页(不同参数)key 相同、不同页 key 不同
+            // → 导航时据此判断「重建」or「仅换参数」。不再用 module_path!()(重命名 / 移动 / 跨 crate 复用都稳定)。
+            rui::Page::new(#route_id, #strat, move || {
                 #(#bindings)* // 路由参数:模式里的 :name → 对应 signal(reactive,同页换参数即变)
                 #body
             })
@@ -975,7 +989,7 @@ pub fn page(attr: TokenStream, item: TokenStream) -> TokenStream {
 // 组 = 一个 Page(key 固定为 "group:<prefix>"):组内不同页导航时 key 相同 → 不重建,
 //   组布局(dash_shell)持续存在,只有内层 outlet(reactive_block 按 path 选叶子)换内容(不闪、保状态)。
 // 注意:① 匹配按声明顺序(首中即用),具体字面量路由列在 `:param` 通配前。
-//   ② 组内页若自带 `:param`,索引是绝对路径的(前缀会偏移)→ 当前不支持组内页参数(用查询参数或顶层路由)。
+//   ② 组内页可自带 `:param`:outlet 用 with_param_offset(组前缀段数) 包叶子 render,param 读到绝对段(已修)。
 enum RouterItem {
     Page(syn::Path),
     Group { prefix: String, layout: syn::Path, pages: Vec<syn::Path> },
@@ -1082,11 +1096,14 @@ pub fn router(input: TokenStream) -> TokenStream {
                     quote! { #(#conds)||* }
                 };
                 // 内层 outlet:reactive_block 按当前 path 选叶子(组布局只建一次,叶子随 path 换)。
+                // 组前缀段数 = 叶子 param 的绝对偏移:with_param_offset 让组内页的 `:param` 读到绝对段
+                //(否则 #[page] 烘焙的是页内相对索引,会少算前缀段数 → 读错段)。
+                let prefix_segs = prefix.split('/').filter(|s| !s.is_empty()).count();
                 let lp_tok = quote! { (&__lp) };
                 let mut leaf = quote! { rui::View(rui::dom::text("")) };
                 for m in pages.iter().rev() {
                     let lc = cond_for(&lp_tok, m);
-                    leaf = quote! { if #lc { (#m::view().render)() } else { #leaf } };
+                    leaf = quote! { if #lc { rui::runtime::with_param_offset(#prefix_segs, || (#m::view().render)()) } else { #leaf } };
                 }
                 // 组策略 = 当前 path 命中的叶子的 strategy(直接加载 /dash/x 时按该叶子 ssr/csr/static 渲染)。
                 // 组内导航始终是客户端(同 key 不回服务端),故跨策略叶子的切换天然客户端渲染,正确。

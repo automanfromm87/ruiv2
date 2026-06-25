@@ -3,7 +3,7 @@
 
 use crate::dom;
 use crate::reactive::{memo, scope, untrack, Scope, Signal};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     // 当前页的响应式作用域;切页时先 dispose(销毁上一页 query memo,防泄漏 + 幽灵重算)。
@@ -22,11 +22,30 @@ thread_local! {
 pub fn path() -> Signal<String> {
     PATH.with(|p| p.borrow().clone())
 }
-/// 第 i 个路径段(0 基,按 '/' 切、忽略空段)的 reactive 视图。`/todo/1` 的 `param(1)` = "1"。
+// 路由组叶子的 param 偏移:页内相对段索引 + 组前缀段数 = 绝对段索引。顶层页偏移 0(相对=绝对,行为不变)。
+// 组 outlet 用 with_param_offset(前缀段数, ..) 包住叶子 render,使组内页的 `:param`(如 group("/dash"){page("/item/:id")})
+// 读到绝对段。仅在 param/param_as 建 memo 时被读一次(memo 把绝对索引固化),故无需纳入 per-request swap;RAII 复位 panic 安全。
+thread_local! {
+    static PARAM_OFFSET: Cell<usize> = const { Cell::new(0) };
+}
+/// 在 param 偏移 = n 的上下文里运行 f(组路由叶子用,n = 组前缀段数)。RAII 复位(正常或 panic 都还原前值)。
+pub fn with_param_offset<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    struct Reset(usize);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PARAM_OFFSET.with(|o| o.set(self.0));
+        }
+    }
+    let _reset = Reset(PARAM_OFFSET.with(|o| o.replace(n)));
+    f()
+}
+
+/// 第 i 个路径段(0 基,按 '/' 切、忽略空段;再叠加当前组前缀偏移)的 reactive 视图。`/todo/1` 的 `param(1)` = "1"。
 /// 同页导航换参数时它会变 → 订阅它的 `resource!` 自动重取,无需整页重建。
 pub fn param(i: usize) -> Signal<String> {
     let p = path();
-    memo(move || p.get().split('/').filter(|s| !s.is_empty()).nth(i).unwrap_or("").to_string())
+    let idx = PARAM_OFFSET.with(|o| o.get()) + i; // 固化绝对索引(组叶子 = 前缀段数 + i;顶层 = i)
+    memo(move || p.get().split('/').filter(|s| !s.is_empty()).nth(idx).unwrap_or("").to_string())
 }
 /// 类型化的第 i 段:解析成 `T`(失败回退 `T::default()`),其余同 `param`。
 /// `#[rui::page("/todo/:id")] fn view(id: Signal<i64>)` 由宏据模式串接到对应 `param_as`。
@@ -35,11 +54,12 @@ where
     T: std::str::FromStr + Default + Clone + PartialEq + 'static,
 {
     let p = path();
+    let idx = PARAM_OFFSET.with(|o| o.get()) + i;
     memo(move || {
         p.get()
             .split('/')
             .filter(|s| !s.is_empty())
-            .nth(i)
+            .nth(idx)
             .and_then(|s| s.parse::<T>().ok())
             .unwrap_or_default()
     })
@@ -445,7 +465,22 @@ macro_rules! client {
 
 #[cfg(test)]
 mod tests {
-    use super::matches;
+    use super::{matches, param_as, set_current_path, with_param_offset};
+
+    #[test]
+    fn group_param_absolute_offset() {
+        // #4 组内 :param:with_param_offset(组前缀段数) 让组内页的 param_as(相对索引) 读到绝对段。
+        // 路径 /dash/item/5 段:[dash, item, 5](idx 0/1/2)。group("/dash") 前缀 1 段。
+        set_current_path("/dash/item/5");
+        // 顶层(偏移 0):param_as(1) 读相对索引 1 = "item"
+        assert_eq!(param_as::<String>(1).get(), "item");
+        // 组内(偏移 1):组成员 #[page("/item/:id")] 烘焙 :id 相对索引 1 → 绝对索引 2 = "5"
+        let id = with_param_offset(1, || param_as::<i64>(1));
+        assert_eq!(id.get(), 5, "组内页 :param 应读到绝对段(前缀段数 + 相对索引)");
+        // 偏移已 RAII 复位:此后顶层 param_as 不受影响
+        assert_eq!(param_as::<String>(1).get(), "item");
+        set_current_path("/"); // 复位,避免影响其它测试
+    }
 
     #[test]
     fn inv1_route_identity_param_vs_crosspage() {
