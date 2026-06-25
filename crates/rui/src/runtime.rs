@@ -10,16 +10,17 @@ thread_local! {
     static PAGE_SCOPE: RefCell<Option<Scope>> = const { RefCell::new(None) };
     // 当前页 key(= 页面 module_path):导航时据此判断"同页换参数"还是"换页"。
     static CUR_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
-    // 当前 location.pathname —— path 参数的真相源(Signal::new 非 const,惰性初始化)。
-    static PATH: Signal<String> = Signal::new(String::new());
+    // 当前 location.pathname —— path 参数的真相源。包在 RefCell 里以便服务端 per-request swap
+    //(with_request_runtime 进入时换新鲜 Signal、退出时还原 → 取代原 reset_route_signals 清订阅表)。
+    static PATH: RefCell<Signal<String>> = RefCell::new(Signal::new(String::new()));
     // 当前 location.search 的原始 query 串(去掉前导 '?'),如 "q=foo&sort=asc" —— query 参数的真相源。
     // 与 PATH 完全独立:不参与路由匹配,只供 query_param 派生(path / query 各一条线,互不掺和)。
-    static QUERY: Signal<String> = Signal::new(String::new());
+    static QUERY: RefCell<Signal<String>> = RefCell::new(Signal::new(String::new()));
 }
 
 /// 当前路径 signal(路由参数从它派生)。
 pub fn path() -> Signal<String> {
-    PATH.with(|p| p.clone())
+    PATH.with(|p| p.borrow().clone())
 }
 /// 第 i 个路径段(0 基,按 '/' 切、忽略空段)的 reactive 视图。`/todo/1` 的 `param(1)` = "1"。
 /// 同页导航换参数时它会变 → 订阅它的 `resource!` 自动重取,无需整页重建。
@@ -55,7 +56,7 @@ pub fn matches(pattern: &str, path: &str) -> bool {
 
 /// 当前 query 串 signal(原始,如 "q=foo&sort=asc")。
 pub fn query_string() -> Signal<String> {
-    QUERY.with(|q| q.clone())
+    QUERY.with(|q| q.borrow().clone())
 }
 /// 命名 query 参数的 reactive 视图:`?q=foo` 的 `query_param("q")` = "foo"(缺省 "";值经 percent/`+` 解码)。
 /// 同页换 query(`?q=a`→`?q=b`)时它变 → 订阅它的 `resource!` 自动重取,无需重建。
@@ -133,6 +134,7 @@ fn set_path(path: &str) {
     // 值不变就不写:Signal/memo 都不做 PartialEq 去抖,否则导航到同一 URL 会让
     // param memo 重算并重通知 → resource! 冗余重取。这里挡住"同路径"的多余刷新。
     PATH.with(|p| {
+        let p = p.borrow();
         if untrack(|| p.get()) != path {
             p.set(path.to_string());
         }
@@ -140,6 +142,7 @@ fn set_path(path: &str) {
 }
 fn set_query(query: &str) {
     QUERY.with(|q| {
+        let q = q.borrow();
         if untrack(|| q.get()) != query {
             q.set(query.to_string());
         }
@@ -154,13 +157,31 @@ pub fn set_current_query(query: &str) {
     set_query(query);
 }
 
-/// SSR 每渲染前清 PATH/QUERY 的订阅表(它们是跨渲染持久的全局 Signal)。配合 reactive::reset():
-/// 复用线程 + 重用 effect id 时,持久 signal 残留的旧订阅 id 会与新 id 碰撞、破坏订阅 —— 故必须清。
-/// 一连接一线程下线程会死、无害(本就是空的)。
+// ── per-request 运行时隔离(服务端):路由 signal 的 take/restore,配合 with_request_runtime ──
+// 只含 PATH/QUERY(path 参数真相源)。PAGE_SCOPE/CUR_KEY 是客户端导航态,服务端从不填充 → 不纳入。
+// swap 换入新鲜 Signal(订阅表天然为空)→ 原 reset_route_signals 的"清订阅表"被结构性地取代。
+
+/// 路由 signal 的一次性快照(PATH + QUERY)。
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn reset_route_signals() {
-    PATH.with(|p| p.clear_subs());
-    QUERY.with(|q| q.clear_subs());
+pub(crate) struct RouteState {
+    path: Signal<String>,
+    query: Signal<String>,
+}
+
+/// 取出当前 PATH/QUERY(就地换入新鲜空 Signal),返回旧态供 restore。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn take_route_state() -> RouteState {
+    RouteState {
+        path: PATH.with(|p| std::mem::replace(&mut *p.borrow_mut(), Signal::new(String::new()))),
+        query: QUERY.with(|q| std::mem::replace(&mut *q.borrow_mut(), Signal::new(String::new()))),
+    }
+}
+
+/// 把旧的 PATH/QUERY Signal 写回(丢弃当前请求的脏 Signal)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn restore_route_state(s: RouteState) {
+    PATH.with(|p| *p.borrow_mut() = s.path);
+    QUERY.with(|q| *q.borrow_mut() = s.query);
 }
 
 // ── 生命周期:on_mount(节点入 DOM 后执行,仅客户端)──

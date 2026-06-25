@@ -4,8 +4,9 @@
 //! 桥接要点(详见各处注释):
 //!   · rui 引擎是**同步 + 重度线程局部**,axum 是 async 多线程 → 渲染 / 执行经 `spawn_blocking`
 //!     隔离到阻塞线程一次跑完(不卡 async worker、线程局部安全)。
-//!   · 阻塞池**复用线程**(不像 std `serve` 一连接一线程会死)→ `render_page` 开头 `reactive::reset()`
-//!     清掉只增不减的 EFFECTS 竞技场(否则跨渲染累积 = 泄漏)。
+//!   · 阻塞池**复用线程**(不像 std `serve` 一连接一线程会死)→ 渲染走 `render_page` → `with_request_runtime`:
+//!     进入时 take 四子系统状态(留下新鲜空态)、退出时(正常或 panic)RAII restore,实现 per-request 隔离
+//!     并杜绝跨渲染累积 / 泄漏(取代早期"每渲染开头 reactive::reset()"的清空式做法)。
 //!   · SSE:应用给的是 std mpsc 广播(阻塞 recv)→ 一根专用 std 线程把它泵进 tokio 通道 → axum 异步事件流。
 
 use crate::gql::exec;
@@ -81,7 +82,7 @@ async fn graphql(State(app): State<App>, body: axum::body::Bytes) -> impl IntoRe
     (StatusCode::OK, json_ct, json).into_response()
 }
 
-// 兜底:同构 SSR。spawn_blocking 跑同步渲染(render_page 开头 reactive::reset 清竞技场)。
+// 兜底:同构 SSR。spawn_blocking 跑同步渲染(render_page 经 with_request_runtime 隔离本次请求的竞技场)。
 async fn ssr(State(app): State<App>, uri: Uri) -> impl IntoResponse {
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or("").to_string();

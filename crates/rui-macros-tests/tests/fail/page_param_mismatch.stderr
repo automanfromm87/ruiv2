@@ -1,0 +1,5 @@
+error: #[rui::page] 参数 `wrong` 不在路由模式 `/todo/:id` 里(应为 `:wrong` 段)
+ --> tests/fail/page_param_mismatch.rs:4:11
+  |
+4 | fn detail(wrong: rui::reactive::Signal<String>) -> rui::View {
+  |           ^^^^^

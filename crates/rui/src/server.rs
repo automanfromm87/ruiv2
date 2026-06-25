@@ -64,16 +64,71 @@ pub fn serve(app: App) {
     }
 }
 
-/// 服务端渲染一个 Page 的 render 闭包,产出 HTML 片段(同构,query! 本地预取带数据)。
-fn render_page(p: crate::view::Page) -> String {
-    crate::reactive::reset(); // 清反应式竞技场(EFFECTS 只增不减):线程池复用线程时必需;std 线程会死、是 no-op
-    crate::runtime::reset_route_signals(); // 清 PATH/QUERY 持久 signal 的订阅表(配合 reset 的 id 重用)
-    crate::dom::reset();
-    crate::gql::store::reset(); // 清空规范化缓存,保证请求间隔离
-    let render = p.render;
-    let (node, _sc) = crate::reactive::scope(move || render()); // SSR 一次性:effect 立即跑填好 signal,scope 随后 drop
-    crate::dom::mount(node.node());
-    crate::dom::take_html()
+/// per-request 运行时:把四子系统的"当前态"打包,供 with_request_runtime 进入时换新鲜、退出时还原。
+/// 非 Send(全是 thread_local 拥有态)—— 只在单线程内 take→run→restore,不跨线程。
+struct RequestRuntime {
+    reactive: crate::reactive::ReactiveState,
+    store: crate::gql::store::StoreState,
+    dom: crate::dom::DomNativeState,
+    route: crate::runtime::RouteState,
+}
+
+// 嵌套深度(仅 debug):顶层渲染进入时才断言"竞技场已空"。嵌套时外层渲染中途可能已建 live effect,正常,不断言。
+#[cfg(debug_assertions)]
+thread_local! {
+    static RT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// 在一个隔离的、新鲜的 per-request 运行时里执行 f。进入时把四子系统全部 thread_local 换成新鲜空态
+/// (取代原"每渲染手动按序 4 次 reset"),退出时(正常或 panic)经 RAII 还原旧态。隔离从"记得按序 reset"
+/// 的约定升级为"在 guard 作用域内"的结构性属性,且天然 panic 安全 + 支持嵌套(还原旧态而非清空)。
+/// **仅服务端**:wasm 端 app 长生单全局,绝不调用(否则会清掉运行中的 app)。四子系统互不读对方 thread_local,
+/// 故 take 顺序无关;但必须**整组**一起换(EFFECTS 的 id 被 store VERSIONS / PATH-QUERY 的订阅表交叉引用,
+/// 只换一部分 = 换入的 arena 持有指向另一 arena EFFECTS 的 id → 静默腐蚀)。
+fn with_request_runtime<R>(f: impl FnOnce() -> R) -> R {
+    // 进入前(仅顶层)上一渲染应已 restore 干净(否则是状态泄漏)——debug 哨兵尽早暴露。
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        RT_DEPTH.with(|d| d.get()) != 0 || crate::reactive::state_is_empty(),
+        "进入顶层 with_request_runtime 时反应式竞技场非空:上一渲染未还原(状态泄漏)"
+    );
+    let saved = RequestRuntime {
+        reactive: crate::reactive::take_state(),
+        store: crate::gql::store::take_state(),
+        dom: crate::dom::take_native_state(),
+        route: crate::runtime::take_route_state(),
+    };
+    struct Restore(Option<RequestRuntime>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let s = self.0.take().unwrap();
+            crate::reactive::restore_state(s.reactive);
+            crate::gql::store::restore_state(s.store);
+            crate::dom::restore_native_state(s.dom);
+            crate::runtime::restore_route_state(s.route);
+            #[cfg(debug_assertions)]
+            RT_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    #[cfg(debug_assertions)]
+    RT_DEPTH.with(|d| d.set(d.get() + 1));
+    let _restore = Restore(Some(saved)); // RAII:f 正常返回或 panic 都还原旧态 + 递减深度
+    f()
+}
+
+/// 服务端渲染一个 Page,产出 (HTML 片段, 脱水数据)。整个渲染在隔离的 per-request 运行时内完成
+/// —— set_path/query 与 dehydrate 都必须在作用域内(退出后 PATH/SSR_RESP 已还原清空,读不到)。
+fn render_page(p: crate::view::Page, path: &str, query: &str) -> (String, String) {
+    with_request_runtime(|| {
+        crate::runtime::set_current_path(path); // path 参数:首屏 param() 读到正确段(须在新鲜 PATH 装入后)
+        crate::runtime::set_current_query(query); // query 参数:首屏 query_param() 读到正确值
+        let render = p.render;
+        let (node, _sc) = crate::reactive::scope(move || render()); // effect 立即跑填好 signal,scope 随后 drop(竞技场仍在)
+        crate::dom::mount(node.node());
+        let html = crate::dom::take_html();
+        let data = crate::dom::dehydrate_responses(); // 必须在作用域内读:退出后 SSR_RESP 已还原清空
+        (html, data)
+    })
 }
 
 /// 读取完整 HTTP 请求:先读到 headers 结束(\r\n\r\n),再按 Content-Length 补齐 body。
@@ -190,12 +245,12 @@ fn file(p: &str, ctype: &'static str) -> (&'static str, &'static str, Vec<u8>) {
 //   Static 首次按 Ssr 渲染后按 path 缓存,后续直接复用
 pub(crate) fn page(route: fn(&str) -> crate::view::Page, path: &str, query: &str) -> String {
     use crate::view::Strategy;
-    crate::runtime::set_current_path(path); // path 参数:让首屏 param() 读到正确段
-    crate::runtime::set_current_query(query); // query 参数:让首屏 query_param() 读到正确值
+    // 注:set_current_path/query 已移进 render_page(必须在 with_request_runtime 装入新鲜 PATH 之后设)。
+    // route(path) 只匹配模式 + 构造延迟 render 闭包,不读 PATH signal,故在 runtime 作用域外调用是安全的。
     let pg = route(path);
     match pg.strategy {
-        Strategy::Csr => doc("", ""),
-        Strategy::Ssr => ssr_doc(pg),
+        Strategy::Csr => doc("", ""), // 空壳:不渲染、无需 runtime
+        Strategy::Ssr => ssr_doc(pg, path, query),
         Strategy::Static => {
             static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
             let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -210,7 +265,7 @@ pub(crate) fn page(route: fn(&str) -> crate::view::Page, path: &str, query: &str
             if let Some(h) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
                 return h.clone();
             }
-            let html = ssr_doc(pg);
+            let html = ssr_doc(pg, path, query);
             // 上限保护:防任意 query 串(?utm=.. 等)无界增长 / 缓存洪泛;满了就停止缓存(继续按需渲染)。
             let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
             if map.len() < 1024 {
@@ -222,10 +277,10 @@ pub(crate) fn page(route: fn(&str) -> crate::view::Page, path: &str, query: &str
 }
 
 // SSR:渲染 + 把本次 query 响应注入页面(客户端首屏复用,免重新联网)。
-fn ssr_doc(pg: crate::view::Page) -> String {
-    let app_html = render_page(pg); // 渲染时填充 SSR 响应缓存
+fn ssr_doc(pg: crate::view::Page, path: &str, query: &str) -> String {
+    let (app_html, raw_data) = render_page(pg, path, query); // 渲染 + 在 runtime 作用域内取脱水数据
     // `</` → `<\/` 防止数据里出现 `</script>` 截断标签(JSON 里 \/ 合法)。
-    let data = crate::dom::dehydrate_responses().replace("</", "<\\/");
+    let data = raw_data.replace("</", "<\\/");
     doc(&app_html, &data)
 }
 
@@ -240,4 +295,90 @@ fn doc(app_html: &str, data: &str) -> String {
 <script id=\"__rui_data\" type=\"application/json\">{data}</script>\
 <script type=\"module\" src=\"/router.js\"></script></body></html>"
     )
+}
+
+#[cfg(test)]
+mod runtime_isolation_tests {
+    // #3 完整运行时上下文(swap)的隔离回归。守住:复用线程上请求间隔离(INV-2)、RAII panic 安全、嵌套还原。
+    // 这些是 with_request_runtime 相对"裸 thread_local"的真正增量(thread_local 本就跨线程隔离;
+    // swap 额外保证**同线程顺序/嵌套隔离** + panic 时也还原)。SSR 压测是端到端补充,这里是 CI 可跑的持久版。
+    use super::with_request_runtime;
+    use crate::gql::{parse, store};
+
+    #[test]
+    fn sequential_renders_isolated_on_same_thread() {
+        // INV-2 端到端:同一线程上,请求 B 看不到请求 A 写进 store 的数据。
+        let seen_in_b = with_request_runtime(|| {
+            store::normalize_list(&parse(r#"[{"__typename":"Todo","__id":"1","text":"req-A"}]"#));
+            assert!(store::read_entity("Todo:1").is_some(), "请求 A 内可见自己写入的数据");
+            with_request_runtime(|| store::read_entity("Todo:1")) // 紧接着的"下一请求"
+        });
+        assert!(seen_in_b.is_none(), "请求 B 不得看到请求 A 的 store(swap 隔离,非靠线程死亡)");
+    }
+
+    #[test]
+    fn panic_during_render_leaves_clean_state_for_next() {
+        // 渲染期 panic 后,同线程下一渲染仍是干净竞技场(RAII restore 在 unwind 时也会跑)。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_request_runtime(|| {
+                store::normalize_list(&parse(r#"[{"__typename":"Todo","__id":"9","text":"脏"}]"#));
+                panic!("模拟渲染期 panic");
+            })
+        }));
+        let leaked = with_request_runtime(|| store::read_entity("Todo:9"));
+        assert!(leaked.is_none(), "panic 渲染写入的脏 store 必须被 RAII 还原,不泄漏给下一渲染");
+    }
+
+    #[test]
+    fn render_panic_with_live_child_scope_effects_does_not_abort() {
+        // 回归(review 抓到的 critical):渲染期 panic 时,半建的 reactive_block/keyed_for effect(其闭包持有
+        // 一个"带 effect 的子 Scope")若残留 EFFECTS,with_request_runtime 退出 restore 丢弃脏竞技场会触发
+        // Scope::drop → dispose_effect 重入 → RefCell 双借 → unwind 中二次 panic → 进程 abort。
+        // 修复:scope 的 PanicGuard 在 unwind 时先 dispose 半建 effect(restore 丢弃的已是全 None 竞技场)+
+        // restore_state 改"先释放借用再 drop"。本测试应被 catch_unwind 捕获(返回 Err),而非 abort 整个进程。
+        use crate::reactive::{effect, scope, Scope};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_request_runtime(|| {
+                scope(|| {
+                    let held: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+                    let h = held.clone();
+                    effect(move || {
+                        let (_, child) = scope(|| {
+                            effect(|| {}); // 子作用域内的 effect → 子 Scope.ids 非空 → 其 drop 会重入 dispose_effect
+                        });
+                        *h.borrow_mut() = Some(child); // effect 闭包持有带 effect 的子 Scope(同 reactive_block/keyed_for)
+                    });
+                    panic!("模拟渲染期 panic(EFFECTS 里有持子 Scope 的 live effect)");
+                });
+            })
+        }));
+        assert!(r.is_err(), "渲染 panic 必须被 catch_unwind 捕获返回 Err,而非进程 abort");
+        // 下一渲染:竞技场已干净,正常运行(panic 渲染未泄漏 live effect / 未腐蚀竞技场)。
+        let after = with_request_runtime(|| {
+            store::normalize_list(&parse(r#"[{"__typename":"Todo","__id":"1","text":"after"}]"#));
+            store::read_entity("Todo:1").map(|t| t.field("text").as_str().to_string())
+        });
+        assert_eq!(after.as_deref(), Some("after"), "panic 渲染后下一渲染应在干净竞技场上正常运行");
+    }
+
+    #[test]
+    fn nested_runtime_restores_outer() {
+        // 嵌套:内层见新鲜态、可写自己的;退出内层后外层状态原样还原(支持多上下文,非破坏)。
+        with_request_runtime(|| {
+            store::normalize_list(&parse(r#"[{"__typename":"Todo","__id":"7","text":"outer"}]"#));
+            let inner = with_request_runtime(|| {
+                assert!(store::read_entity("Todo:7").is_none(), "内层不应看到外层数据");
+                store::normalize_list(&parse(r#"[{"__typename":"Todo","__id":"7","text":"inner"}]"#));
+                store::read_entity("Todo:7").unwrap().field("text").as_str().to_string()
+            });
+            assert_eq!(inner, "inner");
+            assert_eq!(
+                store::read_entity("Todo:7").unwrap().field("text").as_str(),
+                "outer",
+                "退出内层后外层 store 被 RAII 还原为 outer(未被内层污染)"
+            );
+        });
+    }
 }

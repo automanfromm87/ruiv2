@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rui", "crates/rui-macros", "crates/rui-cli", "examples/stocks"]
+members = ["crates/rui", "crates/rui-macros", "crates/rui-macros-tests", "crates/rui-cli", "examples/stocks"]
 
 [profile.release]
 opt-level = "s"

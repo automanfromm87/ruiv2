@@ -46,10 +46,9 @@ thread_local! {
     static BATCH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// 把整个反应式竞技场清回初始态。**仅供 SSR 服务端「每次渲染前」调用**:
-/// 线程池复用线程时,`EFFECTS`(只增不减、原本靠线程死亡整体回收)会跨渲染累积 → 必须手动清空。
-/// std「一连接一线程」模型线程会死、无需它(调了也只是清空本就空的竞技场,无害)。
-/// 客户端(浏览器单线程长生 app)**勿调** —— 会清掉当前 app 的全部 effect/context。
+/// 把整个反应式竞技场清回初始态(清空式,非 take/restore)。
+/// 注:SSR 渲染链现已改用 `with_request_runtime`(take/restore swap,见 server.rs),不再走 reset();
+/// 此函数保留为公开工具(测试 / 嵌入场景按需整体清空)。客户端(浏览器单线程长生 app)**勿调** —— 会清掉当前 app。
 pub fn reset() {
     CURRENT.with(|c| c.set(None));
     EFFECTS.with(|e| e.borrow_mut().clear());
@@ -59,6 +58,74 @@ pub fn reset() {
     PENDING.with(|p| p.borrow_mut().clear());
     FLUSHING.with(|f| f.set(false));
     BATCH.with(|b| b.set(0));
+}
+
+// ── per-request 运行时隔离(服务端):take/restore 取代 reset 的"清空" ──
+// 反应式竞技场全部 thread_local 打包成 ReactiveState。with_request_runtime 进入时 take(留下新鲜空态),
+// 退出时(正常或 panic)restore 旧态(RAII)。隔离从"记得渲染前 reset"的约定升级为"在 guard 作用域内"的
+// 结构性属性,且支持嵌套(restore 旧态而非清空)。**仅服务端**:wasm 端 app 长生单全局,绝不 take/restore。
+
+/// 反应式竞技场的一次性快照(8 个 thread_local 的拥有态)。字段私有 → 仅本模块构造/读取,外部不透明持有。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ReactiveState {
+    current: Option<usize>,
+    effects: Vec<Option<EffectNode>>,
+    owner: Vec<Vec<usize>>,
+    cleanups: Vec<Vec<Box<dyn FnOnce()>>>,
+    contexts: Vec<HashMap<TypeId, Rc<dyn Any>>>,
+    pending: BinaryHeap<Reverse<(usize, usize)>>,
+    flushing: bool,
+    batch: u32,
+}
+
+/// 取出当前竞技场全部 thread_local(就地留下新鲜空态),返回旧态供之后 restore。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn take_state() -> ReactiveState {
+    ReactiveState {
+        current: CURRENT.with(|c| c.replace(None)),
+        effects: EFFECTS.with(|e| std::mem::take(&mut *e.borrow_mut())),
+        owner: OWNER.with(|o| std::mem::take(&mut *o.borrow_mut())),
+        cleanups: CLEANUPS.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        contexts: CONTEXTS.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        pending: PENDING.with(|p| std::mem::take(&mut *p.borrow_mut())),
+        flushing: FLUSHING.with(|f| f.replace(false)),
+        batch: BATCH.with(|b| b.replace(0)),
+    }
+}
+
+/// 把 take_state 保存的旧态写回 thread_local(丢弃当前脏态)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn restore_state(s: ReactiveState) {
+    CURRENT.with(|c| c.set(s.current));
+    // EFFECTS 须"先取出脏 Vec 放掉借用、再 drop":脏 Vec 里的 EffectNode 闭包可能持有子 Scope,其 Drop 会重入
+    // dispose_effect→EFFECTS.borrow_mut()。若用 `*borrow_mut() = ...` 形式(借用内原地析构旧 Vec)→ 双借 panic。
+    // 与 dispose_effect(line 404)、take_state 的"先取出再处理"同构。正常路径脏 Vec 全 None、无害;此为渲染
+    // panic 路径(scope 已被其 PanicGuard 清空,理论上也全 None)的纵深防御。其余子系统的载荷(Box<FnOnce> 不被
+    // 调用、Rc<dyn Any>/(usize,usize) 无自定义 Drop)落地即析构不会重入,故原地赋值安全。
+    let dirty_effects = EFFECTS.with(|e| std::mem::replace(&mut *e.borrow_mut(), s.effects));
+    drop(dirty_effects); // 借用已释放,此处析构即便重入 dispose_effect 也安全
+    OWNER.with(|o| *o.borrow_mut() = s.owner);
+    CLEANUPS.with(|c| *c.borrow_mut() = s.cleanups);
+    CONTEXTS.with(|c| *c.borrow_mut() = s.contexts);
+    PENDING.with(|p| *p.borrow_mut() = s.pending);
+    FLUSHING.with(|f| f.set(s.flushing));
+    BATCH.with(|b| b.set(s.batch));
+}
+
+/// 调试哨兵:竞技场是否"无存活状态"(进入 with_request_runtime 前断言上一渲染已 restore 干净 → 尽早暴露泄漏)。
+/// 容忍 EFFECTS 里**已 dispose 的 None 空槽**(id 不复用,清空靠整体回收/swap;空槽无害)——
+/// 真正的腐蚀信号是:存活 effect / 挂起 flush / 未平衡的 batch / 残留 PENDING / 残留 owner·context 帧。
+/// (这种容忍也让 cargo test 复用线程跑完 reactive 测试后留下的空槽不误触哨兵。)
+#[cfg(all(not(target_arch = "wasm32"), debug_assertions))]
+pub(crate) fn state_is_empty() -> bool {
+    CURRENT.with(|c| c.get().is_none())
+        && EFFECTS.with(|e| e.borrow().iter().all(|n| n.is_none())) // 无存活 effect(允许已 dispose 空槽)
+        && OWNER.with(|o| o.borrow().is_empty())
+        && CLEANUPS.with(|c| c.borrow().is_empty()) // 残留 cleanup 帧也是泄漏信号
+        && CONTEXTS.with(|c| c.borrow().is_empty())
+        && PENDING.with(|p| p.borrow().is_empty())
+        && !FLUSHING.with(|f| f.get())
+        && BATCH.with(|b| b.get()) == 0
 }
 
 /// 注册一个卸载回调:当前 `scope`(页面 / 子树)被销毁时执行 —— 清定时器 / 解绑 / 销毁第三方实例。
@@ -141,15 +208,6 @@ pub struct Signal<T> {
 impl<T> Clone for Signal<T> {
     fn clone(&self) -> Self {
         Signal { inner: self.inner.clone(), subs: self.subs.clone(), src_height: self.src_height.clone() }
-    }
-}
-
-impl<T> Signal<T> {
-    /// 清空订阅者表。仅用于「跨渲染持久」的 Signal(如 runtime 的 PATH/QUERY):服务端复用线程 +
-    /// reactive::reset() 重用 effect id 时,这类持久 signal 的旧订阅 id 会与新 id 碰撞 → 必须每渲染清。
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn clear_subs(&self) {
-        self.subs.borrow_mut().clear();
     }
 }
 
@@ -422,7 +480,24 @@ pub fn scope<R>(f: impl FnOnce() -> R) -> (R, Scope) {
     OWNER.with(|o| o.borrow_mut().push(Vec::new()));
     CLEANUPS.with(|c| c.borrow_mut().push(Vec::new()));
     CONTEXTS.with(|c| c.borrow_mut().push(HashMap::new())); // 本作用域的 provide_context 写这帧
+                                                            // RAII:f() panic 时也要 pop 三帧 + dispose 本作用域已建的 effect。否则半建的
+                                                            // reactive_block/keyed_for effect 会带着子 Scope 残留在 EFFECTS 里,SSR 的
+                                                            // with_request_runtime 退出 restore 丢弃脏竞技场时 → Scope::drop 重入 dispose_effect
+                                                            // → RefCell 双借 → unwind 中二次 panic → 进程 abort(且帧也泄漏)。正常路径 forget 掉。
+    struct PanicGuard;
+    impl Drop for PanicGuard {
+        fn drop(&mut self) {
+            let ids = OWNER.with(|o| o.borrow_mut().pop().unwrap_or_default());
+            let cleanups = CLEANUPS.with(|c| c.borrow_mut().pop().unwrap_or_default());
+            CONTEXTS.with(|c| {
+                c.borrow_mut().pop();
+            });
+            drop(Scope { ids, cleanups }); // 复用 Scope::drop:跑 cleanup + dispose 本组 effect(此刻 EFFECTS 未被借用,安全)
+        }
+    }
+    let guard = PanicGuard;
     let r = f();
+    std::mem::forget(guard); // 正常路径:不走 guard 清理,改由下面手动 pop 构建返回的 Scope(行为同原实现)
     let ids = OWNER.with(|o| o.borrow_mut().pop().unwrap_or_default());
     let cleanups = CLEANUPS.with(|c| c.borrow_mut().pop().unwrap_or_default());
     CONTEXTS.with(|c| {

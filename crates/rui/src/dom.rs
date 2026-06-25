@@ -459,6 +459,37 @@ mod backend {
         SSR_RESP.with(|r| r.borrow_mut().clear());
         FETCH_HANDLERS.with(|h| h.borrow_mut().clear()); // query!/resource! 回调随渲染累积:复用线程时必清,否则只增不减
     }
+
+    // ── per-request 运行时隔离:native DOM 树 + SSR 预取的 take/restore,配合 with_request_runtime ──
+
+    /// native 后端全部 per-request thread_local 的快照(DOM 树 ARENA/HID/DOC_ROOT + SSR 预取 FETCH_HANDLERS/SSR_RESP)。
+    pub struct DomNativeState {
+        arena: Vec<Node>,
+        hid: u32,
+        doc_root: Option<u32>,
+        fetch_handlers: Vec<Option<std::rc::Rc<dyn Fn(&str)>>>,
+        ssr_resp: Vec<(String, String)>,
+    }
+
+    /// 取出当前 native DOM 全部 thread_local(就地留新鲜空态),返回旧态供 restore。
+    pub fn take_native_state() -> DomNativeState {
+        DomNativeState {
+            arena: ARENA.with(|a| std::mem::take(&mut *a.borrow_mut())),
+            hid: HID.with(|h| h.replace(0)),
+            doc_root: DOC_ROOT.with(|d| d.replace(None)),
+            fetch_handlers: FETCH_HANDLERS.with(|h| std::mem::take(&mut *h.borrow_mut())),
+            ssr_resp: SSR_RESP.with(|r| std::mem::take(&mut *r.borrow_mut())),
+        }
+    }
+
+    /// 把旧态写回(丢弃当前脏 DOM 树/预取)。
+    pub fn restore_native_state(s: DomNativeState) {
+        ARENA.with(|a| *a.borrow_mut() = s.arena);
+        HID.with(|h| h.set(s.hid));
+        DOC_ROOT.with(|d| d.set(s.doc_root));
+        FETCH_HANDLERS.with(|h| *h.borrow_mut() = s.fetch_handlers);
+        SSR_RESP.with(|r| *r.borrow_mut() = s.ssr_resp);
+    }
     pub fn take_html() -> String {
         let mut s = String::new();
         if let Some(r) = DOC_ROOT.with(|d| d.get()) {

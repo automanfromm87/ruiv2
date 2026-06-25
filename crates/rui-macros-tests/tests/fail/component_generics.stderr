@@ -1,0 +1,5 @@
+error: #[rui::component] 暂不支持泛型 / where 约束(props 走具名结构体 + builder);如需多态请用具体类型或 enum
+ --> tests/fail/component_generics.rs:3:9
+  |
+3 | fn thing<T>(label: T) -> rui::View {
+  |         ^^^

@@ -264,6 +264,31 @@ pub fn reset() {
     VERSIONS.with(|v| v.borrow_mut().clear());
 }
 
+// ── per-request 运行时隔离(服务端):规范化缓存的 take/restore,配合 with_request_runtime ──
+
+/// 规范化缓存的一次性快照(ENTITIES + VERSIONS)。字段私有,外部不透明持有。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct StoreState {
+    entities: HashMap<String, Value>,
+    versions: HashMap<String, Signal<u64>>,
+}
+
+/// 取出当前 store 全部 thread_local(就地留新鲜空态),返回旧态供 restore。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn take_state() -> StoreState {
+    StoreState {
+        entities: ENTITIES.with(|e| std::mem::take(&mut *e.borrow_mut())),
+        versions: VERSIONS.with(|v| std::mem::take(&mut *v.borrow_mut())),
+    }
+}
+
+/// 把旧态写回(丢弃当前脏缓存)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn restore_state(s: StoreState) {
+    ENTITIES.with(|e| *e.borrow_mut() = s.entities);
+    VERSIONS.with(|v| *v.borrow_mut() = s.versions);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

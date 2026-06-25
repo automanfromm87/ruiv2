@@ -1,0 +1,14 @@
+# 宏契约测试(dev-only,不进任何产物):用 trybuild 锁住宏的「拒绝行为 + 错误消息」契约。
+# 这些是 examples/stocks 编译覆盖不到的负向用例(它只能验证「能编」,验证不了「该拒就拒 + 错在哪」)。
+# 也是 Phase C(宏路径 registry)/ Phase D(RouteId)改宏 emission 时的回归网:契约一变,这里立刻红。
+# 注:rui 框架本体仍零依赖;trybuild 只是本测试 crate 的 dev-dependency,不影响默认构建 / 产物。
+[package]
+name = "rui-macros-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+trybuild = "1"
+rui = { path = "../rui" }
+rui-macros = { path = "../rui-macros" }

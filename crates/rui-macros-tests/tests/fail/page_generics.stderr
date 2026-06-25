@@ -1,0 +1,5 @@
+error: #[rui::page] 不支持泛型 / where 约束:页面函数会被改写为 fn() -> rui::Page
+ --> tests/fail/page_generics.rs:3:8
+  |
+3 | fn home<T>(x: T) -> rui::View {
+  |        ^^^
