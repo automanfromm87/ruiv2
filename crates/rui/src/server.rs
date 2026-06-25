@@ -20,7 +20,7 @@ static RESOLVE: OnceLock<Resolver> = OnceLock::new();
 /// 注册应用的 GraphQL resolver(serve 启动时调用一次)。
 pub fn set_resolver(r: Resolver) {
     let _ = RESOLVE.set(r);
-    crate::gql::set_transport(local_execute); // 依赖倒置:把 SSR 预取 transport 注入 gql(dom 经 gql::fetch 调它,不 NAME server)
+    crate::gql::set_transport(Box::new(local_execute)); // 依赖倒置:把 SSR 预取 transport 注入 gql(legacy exec;async-graphql 路径见 set_graphql_schema)
 }
 
 /// 同构 SSR:native 端 `dom::gql` 用已注册的 resolver 本地执行查询(首屏预取)。

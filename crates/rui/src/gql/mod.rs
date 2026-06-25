@@ -127,9 +127,11 @@ impl ToGqlArg for bool {
 #[cfg(not(target_arch = "wasm32"))]
 mod transport {
     use std::sync::OnceLock;
-    static TRANSPORT: OnceLock<fn(&str) -> String> = OnceLock::new();
-    /// host 启动时注册「同步执行一个 query 串 → 响应文本」的实现(native = server::local_execute)。
-    pub fn set_transport(f: fn(&str) -> String) {
+    // Box<dyn Fn>(非裸 fn 指针):让 async-graphql 桥能注册「捕获 Schema 的闭包」(set_graphql_schema)。
+    type Transport = Box<dyn Fn(&str) -> String + Send + Sync>;
+    static TRANSPORT: OnceLock<Transport> = OnceLock::new();
+    /// host 启动时注册「同步执行一个 query 串 → 响应文本」的实现(legacy=local_execute / async-graphql=block_on schema)。
+    pub fn set_transport(f: Transport) {
         let _ = TRANSPORT.set(f);
     }
     /// SSR 预取:执行一个 query 串拿响应文本。未注册 transport(如最小骨架 / 测试)→ 返回空数据,不 panic。

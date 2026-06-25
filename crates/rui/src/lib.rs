@@ -56,8 +56,10 @@ pub mod server;
 // 生产 HTTP 后端(feature = "axum"):rui::serve_axum(App) / serve_axum_with(App, AppConfig)。仅非 wasm。
 #[cfg(all(not(target_arch = "wasm32"), feature = "axum"))]
 pub mod server_axum;
+// set_graphql_schema:注册 async-graphql Schema 作为 GraphQL 引擎(应用直接 dep async-graphql 定义 schema,
+// 与 rui 同版本 → cargo 统一为一份,Schema 满足 rui 这边的 async_graphql::Executor bound)。
 #[cfg(all(not(target_arch = "wasm32"), feature = "axum"))]
-pub use server_axum::{serve_axum, serve_axum_with};
+pub use server_axum::{serve_axum, serve_axum_with, set_graphql_schema};
 
 // 宏:应用直接用 rui::view! / rui::query! / #[derive(rui::GqlObject)] / #[rui::gql_root(..)] 等。
 pub use rui_macros::{

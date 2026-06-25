@@ -9,7 +9,6 @@
 //!     并杜绝跨渲染累积 / 泄漏(取代早期"每渲染开头 reactive::reset()"的清空式做法)。
 //!   · SSE:应用给的是 std mpsc 广播(阻塞 recv)→ 一根专用 std 线程把它泵进 tokio 通道 → axum 异步事件流。
 
-use crate::gql::exec;
 use crate::server::{config, page, set_config, set_resolver, AppConfig};
 use crate::App;
 use axum::extract::{DefaultBodyLimit, State};
@@ -83,11 +82,38 @@ async fn graphql(State(app): State<App>, body: axum::body::Bytes) -> impl IntoRe
                 .into_response()
         }
     };
-    let json = tokio::task::spawn_blocking(move || exec::execute(&q, app.resolve)).await.unwrap_or_else(|e| {
+    // 经 transport 执行:已注册 async-graphql(set_graphql_schema)则走它(spawn_blocking 里 block_on schema.execute),
+    // 否则回退 legacy exec(set_resolver 注册)。spawn_blocking 隔离同步执行,不卡 async worker。
+    let _ = app; // resolver 现经 transport;App.resolve 仅 std host / legacy 用
+    let json = tokio::task::spawn_blocking(move || crate::gql::fetch(&q)).await.unwrap_or_else(|e| {
         eprintln!("rui: /graphql 执行任务 panic:{e}"); // JoinError 不再静默吞掉
         r#"{"data":null,"errors":[{"message":"internal error"}]}"#.to_string()
     });
     (StatusCode::OK, json_ct, json).into_response()
+}
+
+/// 注册 async-graphql Schema 作为 GraphQL 引擎(取代手搓 exec):/graphql + SSR 预取都经它执行。
+/// 经 transport 接缝注入 —— SSR 同步预取在 spawn_blocking 线程上 `Handle::block_on(schema.execute())` 合法、不 panic
+/// (该线程非 runtime worker)。在 serve_axum 前调用(先占住 transport;serve_axum 内 set_resolver 的 legacy
+/// set_transport 因 OnceLock set-once 被忽略)。Response 经 serde_json 序列化成标准 {data,errors?} JSON。
+pub fn set_graphql_schema<E>(schema: E)
+where
+    E: async_graphql::Executor,
+{
+    crate::gql::set_transport(Box::new(move |q: &str| {
+        // SSR 预取订阅取「初值 = 当前值」:async-graphql 的 subscription 是流、execute 不支持 →
+        // 把前导 subscription 改写成 query(应用须在 Query 根镜像同名字段)。只 SSR 预取会把 subscription 发到 transport
+        //(浏览器订阅走 SSE /graphql/subscribe,不经此)。
+        let q = q.trim_start();
+        let q = if let Some(rest) = q.strip_prefix("subscription") {
+            format!("query{rest}")
+        } else {
+            q.to_string()
+        };
+        let resp = tokio::runtime::Handle::current().block_on(schema.execute(async_graphql::Request::new(q)));
+        serde_json::to_string(&resp)
+            .unwrap_or_else(|_| r#"{"data":null,"errors":[{"message":"serialize error"}]}"#.to_string())
+    }));
 }
 
 // 兜底:同构 SSR。spawn_blocking 跑同步渲染(render_page 经 with_request_runtime 隔离本次请求的竞技场)。

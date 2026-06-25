@@ -1341,7 +1341,8 @@ fn sel_args_lit(args: &[(String, ArgVal)]) -> String {
 }
 // 编译期 selection 字符串(mutation! 用;支持别名 + 字面量参数;片段 spread 不在此支持,跳过)。
 fn sel_to_string(sels: &[Sel]) -> String {
-    sels.iter()
+    let body = sels
+        .iter()
         .filter(|s| s.spread.is_none())
         .map(|s| {
             let head = format!("{}{}", sel_head(s), sel_args_lit(&s.args));
@@ -1352,7 +1353,9 @@ fn sel_to_string(sels: &[Sel]) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    // 每个选择集带 __typename(同 emit_selection;mutation! / fragment! 的串也要让 store 能规范化)。
+    format!("__typename {body}")
 }
 // 运行时把一组参数 push 进 __q(query!/subscription! 用,支持变量)。
 fn emit_args(args: &[(String, ArgVal)]) -> TS2 {
@@ -1378,7 +1381,9 @@ fn emit_args(args: &[(String, ArgVal)]) -> TS2 {
 }
 // 运行时递归把 selection push 进 __q(支持别名 + 嵌套参数 + 变量)。
 fn emit_selection(sels: &[Sel]) -> TS2 {
-    let mut stmts = Vec::new();
+    // 每个对象选择集带 __typename:async-graphql 只返回被选字段,store 规范化要靠它认 entity 类型
+    //(旧 exec 引擎是注入,无害)。只进 query 串,不进 typed 结果结构(gen_sel_struct 不含它)。
+    let mut stmts = vec![quote! { __q.push_str("__typename "); }];
     for s in sels {
         // 片段 spread:把片段的 selection 字符串内联进查询(运行时取 Fragment::SELECTION)。
         if let Some(frag) = &s.spread {

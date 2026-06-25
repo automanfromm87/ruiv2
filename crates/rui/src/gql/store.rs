@@ -45,7 +45,9 @@ fn entity_key(obj: &Value) -> Option<String> {
     if tn.is_empty() {
         return None;
     }
-    let id = scalar_key(obj.get("__id")?)?;
+    // 身份字段:async-graphql 标准输出给 `id`;旧 exec 引擎注入 `__id`。优先 __id、回退 id —— 两种引擎都能 key。
+    // 无 id 的对象(value object:Connection/Edge/PageInfo)→ None → 不规范化、随父内联(行为不变)。
+    let id = obj.get("__id").or_else(|| obj.get("id")).and_then(scalar_key)?;
     Some(format!("{}:{}", tn, id))
 }
 
