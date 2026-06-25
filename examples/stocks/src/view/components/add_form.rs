@@ -27,8 +27,10 @@ pub fn add_form(add: Box<dyn Fn(String)>) -> rui::View {
                 if v.get() { add(d.get().trim().to_string()); d.set(String::new()); }
             } }>
             <div class="flex gap-2">
+                // 键盘:Esc 清空草稿(on:keydown.escape 按键过滤修饰符 → 只在 Esc 时触发)。
                 <input ref={input} class="flex-1 rounded-lg bg-slate-800 px-3 py-2 outline-none placeholder:text-slate-500"
-                    placeholder="加一个待办,回车添加…" bind:value={draft} />
+                    placeholder="加一个待办,回车添加(Esc 清空)…" bind:value={draft.clone()}
+                    on:keydown.escape={ let d = draft.clone(); move || d.set(String::new()) } />
                 <button class={ let v = valid.clone(); move || if v.get() {
                     "rounded-lg bg-slate-100 px-4 py-2 font-medium text-slate-900 hover:bg-white transition-all"
                 } else {

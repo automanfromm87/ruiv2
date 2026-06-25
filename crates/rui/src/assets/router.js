@@ -7,6 +7,32 @@ const encoder = new TextEncoder();
 const str = (p, l) => dec.decode(new Uint8Array(mem.buffer, p, l));
 const reg = (node) => (nodes.push(node), nodes.length - 1);
 
+// 把一次事件的常用字段编码成紧凑串(字段以 \x1f 分隔,与 Rust dom::Event::decode 对应)。
+// 顺序:value, checked, key, code, ctrl, shift, alt, meta, clientX, clientY, button, deltaY, files。
+// files:input.files 或拖拽 dataTransfer.files;每项 name\x1e size\x1e type,项间 \x1d。
+function encodeEvent(e) {
+  const t = e.target || {};
+  const US = "\x1f", GS = "\x1d", RS = "\x1e";
+  const clean = (s) => String(s == null ? "" : s).replace(/[\x1d\x1e\x1f]/g, ""); // 剥掉分隔控制符,防止用户输入/文件名截断字段
+  const fl = (t.files && t.files.length) ? t.files : (e.dataTransfer && e.dataTransfer.files) || null;
+  const files = fl && fl.length ? Array.from(fl).map((f) => clean(f.name) + RS + f.size + RS + clean(f.type)).join(GS) : "";
+  return [
+    clean(t.value),
+    t.checked ? "1" : "",
+    clean(e.key),
+    clean(e.code),
+    e.ctrlKey ? "1" : "",
+    e.shiftKey ? "1" : "",
+    e.altKey ? "1" : "",
+    e.metaKey ? "1" : "",
+    e.clientX != null ? String(e.clientX) : "",
+    e.clientY != null ? String(e.clientY) : "",
+    e.button != null ? String(e.button) : "",
+    e.deltaY != null ? String(e.deltaY) : "",
+    files,
+  ].join(US);
+}
+
 const env = {
   create_element: (p, l) => reg(document.createElement(str(p, l))),
   create_text: (p, l) => reg(document.createTextNode(str(p, l))),
@@ -18,19 +44,32 @@ const env = {
   set_attr: (id, np, nl, vp, vl) => nodes[id].setAttribute(str(np, nl), str(vp, vl)),
   set_value: (id, p, l) => { nodes[id].value = str(p, l); }, // 受控输入:写 .value property
   set_checked: (id, on) => { nodes[id].checked = !!on; }, // 受控复选框 / 单选:写 .checked property
-  // 事件:把 payload 随 dispatch 传回 wasm。复选框传 target.checked("true"/"false"),其余传 target.value
-  // (单选 change 的 target.value=被选项的 value;<select> 的 target.value=选中 option)。submit 默认 preventDefault。
+  // 事件:描述符 = "事件 修饰符*"(空格分隔)。修饰符:prevent/stop/capture/passive/self + 按键过滤
+  // (enter/esc/escape/tab/space/up/down/left/right/delete/backspace)。把完整事件字段编码后随 dispatch 传回,
+  // Rust 解码成 rui::event();value/checked 等字段供 bind: 与 handler 用。submit 仍默认 preventDefault(向后兼容)。
   add_event: (id, ep, el, h) => {
-    const ev = str(ep, el);
+    const parts = str(ep, el).split(" ");
+    const ev = parts[0];
+    const mods = parts.slice(1);
+    const has = (m) => mods.includes(m);
+    const KEYS = { enter: "enter", esc: "escape", escape: "escape", tab: "tab", space: "space", up: "arrowup", down: "arrowdown", left: "arrowleft", right: "arrowright", delete: "delete", backspace: "backspace" };
+    const wantKeys = mods.map((m) => KEYS[m]).filter(Boolean);
+    const opts = {};
+    if (has("capture")) opts.capture = true;
+    if (has("passive")) opts.passive = true;
     nodes[id].addEventListener(ev, (e) => {
-      if (ev === "submit") e.preventDefault();
-      const t = e.target;
-      const v = t && t.type === "checkbox" ? String(!!t.checked) : (t && t.value != null ? String(t.value) : "");
-      const b = encoder.encode(v);
+      if (has("prevent") || ev === "submit") e.preventDefault();
+      if (has("stop")) e.stopPropagation();
+      if (has("self") && e.target !== nodes[id]) return;
+      if (wantKeys.length) {
+        const k = e.key === " " ? "space" : (e.key || "").toLowerCase();
+        if (!wantKeys.includes(k)) return;
+      }
+      const b = encoder.encode(encodeEvent(e));
       const ptr = wasm.alloc(b.length);
       new Uint8Array(mem.buffer, ptr, b.length).set(b);
       wasm.dispatch(h, ptr, b.length);
-    });
+    }, opts);
   },
   clear_children: (id) => { const e = nodes[id]; while (e.firstChild) e.removeChild(e.firstChild); },
   // GraphQL query/mutation:POST /graphql,响应回 on_fetch。网络失败 → 注入 errors 让 UI 进 error 态(否则 loading 永真)。

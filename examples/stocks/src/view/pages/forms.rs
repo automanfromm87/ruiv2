@@ -11,6 +11,8 @@ pub fn view() -> rui::View {
     let subscribe = Signal::new(false); // 复选框(Signal<bool>)
     let plan = Signal::new(String::from("free")); // 单选组(Signal<String>)
     let color = Signal::new(String::from("blue")); // <select>(Signal<String>)
+    let files = Signal::new(String::new()); // 文件选择回显(读 event().files)
+    let lastkey = Signal::new(String::from("(在下方输入框按键)")); // 按键探测(读 event() 键盘字段)
 
     // 校验:用 memo 从输入派生错误消息 —— 这就是「校验」的惯用法(响应式、可组合),不需要专门的原语。
     let name_err = {
@@ -101,6 +103,36 @@ pub fn view() -> rui::View {
             } else {
                 view! { <p class="text-sm text-slate-500">"修正上面的错误"</p> }
             } }
+
+            // ── 事件系统:文件输入(event().files)+ 按键探测(event() 键盘字段)──
+            <div class="mt-2 flex flex-col gap-3 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
+                <p class="text-sm font-semibold text-slate-300">"事件系统"</p>
+
+                // 文件输入:on:change 读 event().files(name/size/type),拖拽 drop 同样可取。
+                <label class="flex flex-col gap-1">
+                    <span class="text-sm text-slate-400">"选文件(可多选)"</span>
+                    <input type="file" multiple="true" class="text-sm text-slate-400"
+                        on:change={ let f = files.clone(); move || {
+                            let names = rui::event().files.iter()
+                                .map(|m| format!("{}({}B)", m.name, m.size)).collect::<Vec<_>>().join("、");
+                            f.set(if names.is_empty() { "(未选)".into() } else { names });
+                        } } />
+                    <p class="text-xs text-slate-500">{ let f = files.clone(); move || format!("已选:{}", f.get()) }</p>
+                </label>
+
+                // 按键探测:on:keydown 读 event().key + 修饰键(完整事件对象,过去只能拿 value)。
+                <label class="flex flex-col gap-1">
+                    <span class="text-sm text-slate-400">"按键探测(试试 Ctrl/Shift + 任意键)"</span>
+                    <input class={field} placeholder="在此按键…"
+                        on:keydown={ let k = lastkey.clone(); move || {
+                            let e = rui::event();
+                            let mods = [("Ctrl", e.ctrl), ("Shift", e.shift), ("Alt", e.alt), ("Meta", e.meta)]
+                                .iter().filter(|(_, on)| *on).map(|(n, _)| *n).collect::<Vec<_>>().join("+");
+                            k.set(if mods.is_empty() { e.key } else { format!("{}+{}", mods, e.key) });
+                        } } />
+                    <p class="text-xs text-slate-500">{ let k = lastkey.clone(); move || format!("最近按键:{}", k.get()) }</p>
+                </label>
+            </div>
         </div>
     }
 }

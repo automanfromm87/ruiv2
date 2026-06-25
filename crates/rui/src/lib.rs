@@ -17,6 +17,9 @@ pub mod runtime;
 pub mod view;
 
 pub use view::{node_ref, NodeRef, Page, Strategy, View};
+// 事件:on:<event> 的 handler 内用 `rui::event()` 取当前事件快照(键盘 key/修饰键、鼠标坐标、files 等);
+// 零参 handler 不受影响。事件修饰符在 view! 里写 `on:keydown.enter.prevent={..}`。
+pub use dom::{event, Event, FileMeta};
 // ErrorBoundary:子树出错 → 局部 fallback + reset 重试(`<ErrorBoundary fallback=..>`,建在 Context 上)。
 // throw_error 渲染期上报;error_reporter() 渲染期取上报器闭包,事件 / 异步回调里调。
 pub use view::{error_reporter, throw_error, ErrorSink};
@@ -55,6 +58,7 @@ pub use gql::exec::empty_resolver;
 pub mod prelude {
     pub use crate::gql::{FromValue, IntoValue, ToGqlArg, Value};
     pub use crate::reactive::{batch, effect, memo, provide_context, provider, scope, use_context, Signal};
+    pub use crate::dom::{event, Event};
     pub use crate::view::{error_reporter, throw_error, IntoView, View};
     pub use rui_macros::{
         component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource, router,

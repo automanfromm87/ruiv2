@@ -424,6 +424,28 @@ mod tests {
     use crate::reactive::scope;
 
     #[test]
+    fn event_decode_fields() {
+        // 编码顺序:value│checked│key│code│ctrl│shift│alt│meta│clientX│clientY│button│deltaY│files
+        //   (│=\u{1f};files 每项 name\u{1e}size\u{1e}type,项间 \u{1d})
+        let enc = "hello\u{1f}1\u{1f}Enter\u{1f}Enter\u{1f}1\u{1f}\u{1f}\u{1f}1\u{1f}3.5\u{1f}4\u{1f}2\u{1f}\u{1f}a.txt\u{1e}12\u{1e}text/plain\u{1d}b.png\u{1e}99\u{1e}image/png";
+        crate::dom::set_current_event(enc);
+        let e = crate::dom::event();
+        assert_eq!(e.value, "hello");
+        assert!(e.checked);
+        assert_eq!(e.key, "Enter");
+        assert!(e.ctrl && !e.shift && !e.alt && e.meta);
+        assert_eq!(e.client_x, 3.5);
+        assert_eq!(e.button, 2);
+        assert_eq!(e.files.len(), 2);
+        assert_eq!((e.files[0].name.as_str(), e.files[0].size), ("a.txt", 12));
+        assert_eq!(e.files[1].mime, "image/png");
+        // 空载荷 → 全默认(零参 handler / 非输入元素)
+        crate::dom::set_current_event("");
+        let d = crate::dom::event();
+        assert!(d.value.is_empty() && !d.checked && d.files.is_empty());
+    }
+
+    #[test]
     fn error_reporter_noop_outside_boundary() {
         // 不在任何边界内:throw_error 返回 false,error_reporter() 返回 no-op(调用不 panic)。
         let (_r, sc) = scope(|| {

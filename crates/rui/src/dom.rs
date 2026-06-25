@@ -6,6 +6,94 @@
 
 pub use backend::*;
 
+// ─────────────────────────── 事件载荷(两后端共用)───────────────────────────
+// JS 把当前事件的常用字段紧凑编码成一个字符串(随 dispatch 传入),Rust 解码成 Event。
+// 事件 handler 内用 `rui::event()` 读它(线程局部,仅在 handler 运行期有效);零参 handler
+// 完全不受影响(故现有 on:click={move||..} 不用改)。native 端无事件 → 恒为默认值。
+// 编码:字段以 \u{1f} 分隔;files 每项 name\u{1e}size\u{1e}type、项间 \u{1d}。
+
+/// 文件选择的元数据(file input / 拖拽 drop);读取内容用 JS 逃生舱(FileReader)或后续专用 API。
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct FileMeta {
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+}
+
+/// 一次 DOM 事件的快照。`value`/`checked` 来自 target;键盘字段(`key`/`code`/修饰键)、
+/// 指针字段(`client_x/y`/`button`/`delta_y`)、`files` 按需取用(无则默认值)。
+#[derive(Clone, Default, Debug)]
+pub struct Event {
+    pub value: String,
+    pub checked: bool,
+    pub key: String,  // KeyboardEvent.key:"Enter" / "a" / "Escape" / "ArrowDown" / " "
+    pub code: String, // KeyboardEvent.code:"KeyA" / "Enter"
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub meta: bool,
+    pub client_x: f64,
+    pub client_y: f64,
+    pub button: i32,
+    pub delta_y: f64,
+    pub files: Vec<FileMeta>,
+}
+
+impl Event {
+    #[allow(dead_code)] // 仅 wasm 的 run_handler 用;native 无事件
+    fn decode(s: &str) -> Event {
+        let mut it = s.split('\u{1f}');
+        let mut next = || it.next().unwrap_or("");
+        let value = next().to_string();
+        let checked = next() == "1";
+        let key = next().to_string();
+        let code = next().to_string();
+        let ctrl = next() == "1";
+        let shift = next() == "1";
+        let alt = next() == "1";
+        let meta = next() == "1";
+        let client_x = next().parse().unwrap_or(0.0);
+        let client_y = next().parse().unwrap_or(0.0);
+        let button = next().parse().unwrap_or(0);
+        let delta_y = next().parse().unwrap_or(0.0);
+        let files_raw = next();
+        let files = if files_raw.is_empty() {
+            Vec::new()
+        } else {
+            files_raw
+                .split('\u{1d}')
+                .map(|f| {
+                    let mut fp = f.split('\u{1e}');
+                    FileMeta {
+                        name: fp.next().unwrap_or("").to_string(),
+                        size: fp.next().unwrap_or("").parse().unwrap_or(0),
+                        mime: fp.next().unwrap_or("").to_string(),
+                    }
+                })
+                .collect()
+        };
+        Event { value, checked, key, code, ctrl, shift, alt, meta, client_x, client_y, button, delta_y, files }
+    }
+}
+
+thread_local! {
+    static CURRENT_EVENT: std::cell::RefCell<Event> = std::cell::RefCell::new(Event::default());
+}
+
+/// 取当前事件快照。**仅在事件 handler 内有效**:渲染期 / handler 外 / native(SSR)调用返回上一次事件
+/// 或默认值(不报错)。异步回调(set_timeout/Promise)里读到的是届时的"当前"事件,非当初那次 —— 需在
+/// handler 内先 `let e = rui::event();` 抓取再带进异步。数字字段解析失败默认 0;含分隔控制符的输入已在
+/// JS 侧剥除。CURRENT_EVENT 保留上一次事件(含 files Vec)到下次事件覆盖(thread-local,随线程/页释放)。
+pub fn event() -> Event {
+    CURRENT_EVENT.with(|e| e.borrow().clone())
+}
+
+/// 由 run_handler 在调用 handler 前设置(把 dispatch 传入的编码串解码进线程局部)。
+#[allow(dead_code)] // 仅 wasm 的 run_handler 用
+pub(crate) fn set_current_event(encoded: &str) {
+    CURRENT_EVENT.with(|e| *e.borrow_mut() = Event::decode(encoded));
+}
+
 // ─────────────────────────── 浏览器后端(wasm)───────────────────────────
 #[cfg(target_arch = "wasm32")]
 mod backend {
@@ -253,10 +341,14 @@ mod backend {
     pub fn set_checked(node: u32, on: bool) {
         unsafe { ffi::set_checked(node, on as u32) }
     }
-    pub fn run_handler(id: u32, value: &str) {
+    pub fn run_handler(id: u32, encoded: &str) {
+        // encoded = JS 编码的事件载荷:先解码进线程局部(供 rui::event() 读),再把 value 字段
+        // 作为 &str 传给 handler(bind:value/group 用它;零参 on:click 忽略它、按需 rui::event())。
+        super::set_current_event(encoded);
+        let value = super::event().value;
         let f = HANDLERS.with(|h| h.borrow().get(id as usize).cloned());
         if let Some(f) = f {
-            f(value);
+            f(&value);
         }
     }
     pub fn clear(node: u32) {

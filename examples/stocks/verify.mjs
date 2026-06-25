@@ -60,7 +60,15 @@ async function fresh() {
   const fetchFor = (s) => fetches.find((r) => r.query.includes(s));
   const countFor = (s) => fetches.filter((r) => r.query.includes(s)).length;
   const feed = (s, json) => { const r = fetchFor(s); const [p, l] = write(json); X.on_fetch(r.handler, p, l); };
-  const fire = (id, value = "") => { const [p, l] = write(value); X.dispatch(id, p, l); };
+  // 编码完整事件(与 router.js encodeEvent 对应)→ dispatch。opts: {value,checked,key,code,ctrl,shift,alt,meta,clientX,clientY,button,deltaY,files:[{name,size,type}]}
+  const encodeEvt = (o = {}) => {
+    const US = "\x1f", GS = "\x1d", RS = "\x1e";
+    const clean = (s) => String(s == null ? "" : s).replace(/[\x1d\x1e\x1f]/g, ""); // 同 router.js:剥分隔符
+    const files = (o.files || []).map((f) => `${clean(f.name)}${RS}${f.size || 0}${RS}${clean(f.type)}`).join(GS);
+    return [clean(o.value ?? ""), o.checked ? "1" : "", clean(o.key ?? ""), clean(o.code ?? ""), o.ctrl ? "1" : "", o.shift ? "1" : "", o.alt ? "1" : "", o.meta ? "1" : "", o.clientX ?? "", o.clientY ?? "", o.button ?? "", o.deltaY ?? "", files].join(US);
+  };
+  const fireEvent = (id, opts) => { const [p, l] = write(encodeEvt(opts)); X.dispatch(id, p, l); };
+  const fire = (id, value = "") => fireEvent(id, { value }); // 便捷:只带 value(文本/单选)
   const texts = () => nodes.filter(Boolean).map((n) => n.text).filter(Boolean);
   const has = (s) => texts().some((t) => t.includes(s));
   // 从挂载根遍历「活树」收集文本(脱离的旧节点不算 → 负向断言可靠,如"X 已被替换/撤下")。
@@ -100,7 +108,7 @@ async function fresh() {
   const runInterval = (h) => X.run_interval(h); // 手动触发一次定时器回调
   // eval 结果回传:首字节 \x00=ok / \x01=err(与 router.js eval_js 一致)
   const evalReturn = (codeSub, result, okFlag = true) => { const e = evals.find((x) => x.code.includes(codeSub)); const [p, l] = write((okFlag ? "\x00" : "\x01") + result); X.on_fetch(e.handler, p, l); };
-  return { X, render, navigate, onFetch, fire, fetchFor, countFor, feed, texts, has, liveHas, hasAttr, anyChecked, anyClass, runTimeouts, liCount, runInterval, evalReturn, focused, intervals, timeouts, cleared, jsRun, evals, get fetchReq() { return fetchReq; }, get clearAppCalls() { return clearAppCalls; } };
+  return { X, render, navigate, onFetch, fire, fireEvent, fetchFor, countFor, feed, texts, has, liveHas, hasAttr, anyChecked, anyClass, runTimeouts, liCount, runInterval, evalReturn, focused, intervals, timeouts, cleared, jsRun, evals, get fetchReq() { return fetchReq; }, get clearAppCalls() { return clearAppCalls; } };
 }
 
 let ok = true;
@@ -136,14 +144,14 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   const f = await fresh();
   f.render("/");
   f.onFetch(TODOS);
-  // handler 注册序(shell 无 on:):0=提示条×,1=表单submit,2=输入,3/4/5=过滤(全部/未完成/已完成),
-  //   6=全部完成,7=清除,8=改名✎,然后每行 3 个:行a 9=复选框bind/10=toggle/11=删,行b 12/13/14。
-  f.fire(10); // 勾选第一行(toggle 真请求;复选框 bind 是 9,只动视觉)
+  // handler 注册序(shell 无 on:):0=提示×,1=submit,2=输入,3=输入 keydown.escape,4/5/6=过滤,
+  //   7=全部完成,8=清除,9=改名✎,然后每行 3 个:行a 10=复选框bind/11=toggle/12=删,行b 13/14/15。
+  f.fire(11); // 勾选第一行(toggle 真请求;复选框 bind 是 10,只动视觉)
   check(f.fetchReq.query.includes("toggle_todo") && f.fetchReq.query.includes('"a"'), "/         勾选(复选框 on:change)→ 动态 toggle_todo(id=a)");
   f.fire(2, "买牛奶"); // 输入(bind:value)
   f.fire(1); // 提交表单(on:submit)
   check(f.fetchReq.query.includes("add_todo") && f.fetchReq.query.includes("买牛奶"), "/         表单提交 → add_todo(text=买牛奶)");
-  f.fire(6); // 全部完成(mutation! + 乐观)
+  f.fire(7); // 全部完成(mutation! + 乐观)
   check(f.fetchReq.query.includes("complete_all"), "/         全部完成 → mutation! complete_all");
 }
 
@@ -153,11 +161,11 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   f.render("/");
   f.onFetch(TODOS); // a 未完成, b 已完成
   check(f.liCount() === 2, "/         过滤前 2 行");
-  f.fire(4); // 未完成 tab(id 4)
+  f.fire(5); // 未完成 tab(id 5)
   check(f.liCount() === 1, `/         过滤「未完成」→ 1 行,实际 ${f.liCount()}`);
-  f.fire(5); // 已完成 tab(id 5)
+  f.fire(6); // 已完成 tab(id 6)
   check(f.liCount() === 1, `/         过滤「已完成」→ 1 行,实际 ${f.liCount()}`);
-  f.fire(3); // 全部(id 3)
+  f.fire(4); // 全部(id 4)
   check(f.liCount() === 2, "/         过滤「全部」→ 2 行");
 }
 
@@ -276,7 +284,7 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   const f = await fresh();
   f.render("/");
   f.onFetch(TODOS);
-  f.fire(7); // 「清除已完成」按钮 → clear_done mutation(handler 7,被提示条×=0 右移)
+  f.fire(8); // 「清除已完成」按钮 → clear_done mutation(handler 8)
   f.feed('clear_done', '{"errors":[{"message":"nope"}]}');
   check(f.has("操作失败:nope"), "/         mutation! 失败 → on_error 回调写错误横幅(nope)");
 }
@@ -376,8 +384,8 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   check(f.liveHas("年龄=25"), "/forms bind:value 数字 → parse 回 i64");
   f.fire(1, "abc"); // 非法 → parse 失败不写
   check(f.liveHas("年龄=25"), "/forms 非法数字输入被忽略(parse 失败不写 signal)");
-  f.fire(2, "true");
-  check(f.liveHas("订阅=true"), "/forms bind:checked → Signal<bool>");
+  f.fireEvent(2, { checked: true }); // 复选框 change:event().checked=true
+  check(f.liveHas("订阅=true"), "/forms bind:checked → Signal<bool>(读 event().checked)");
   check(f.anyChecked(), "/forms set_checked 回写 .checked(受控复选框)");
   f.fire(4, "pro");
   check(f.liveHas("套餐=pro"), "/forms bind:group 单选 → Signal<String>");
@@ -430,11 +438,40 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   const f = await fresh();
   f.render("/");
   check(f.liveHas("当前用户(来自 context):rui"), "/         改名前显示 context 初值 rui");
-  f.fire(8); // 点 ✎ 进入编辑(handler 8)
+  f.fire(9); // 点 ✎ 进入编辑(handler 9)
   check(f.liveHas("改名"), "/         点 ✎ → 进入编辑态(bind:value 输入框)");
-  f.fire(9, "小明"); // 编辑输入(bind:value handler 9)
-  f.fire(10); // 失焦保存(on:blur handler 10)→ 写回 context signal
+  f.fire(10, "小明"); // 编辑输入(bind:value handler 10)
+  f.fire(11); // 失焦保存(on:blur handler 11)→ 写回 context signal
   check(f.liveHas("当前用户(来自 context):小明"), "/         on:blur 写回 context → 各处显示更新为 小明");
+}
+
+// 23) 事件系统:完整事件数据(rui::event() 取键盘/修饰键/文件)+ on:keydown.escape
+{
+  // 23a /forms 文件输入:on:change 读 event().files(name/size/type)
+  const f = await fresh();
+  f.render("/forms");
+  f.fireEvent(6, { files: [{ name: "report.csv", size: 2048, type: "text/csv" }, { name: "pic.png", size: 99, type: "image/png" }] });
+  check(f.liveHas("report.csv(2048B)") && f.liveHas("pic.png(99B)"), "/forms 文件输入 → event().files(name/size 解码)");
+  // 23b /forms 按键探测:event().key + 修饰键
+  f.fireEvent(7, { key: "k", ctrl: true });
+  check(f.liveHas("最近按键:Ctrl+k"), "/forms event() → key + ctrl 修饰键");
+  f.fireEvent(7, { key: "Enter" });
+  check(f.liveHas("最近按键:Enter"), "/forms event().key=Enter(完整键盘事件,过去只能拿 value)");
+}
+{
+  // 注:修饰符的「按键过滤 / prevent / stop / capture / self」是 router.js add_event 的逻辑(浏览器路径);
+  // 本无头 harness 的 add_event 是 no-op、fire 直触 handler,故只覆盖 handler 效果 + 事件数据解码,
+  // 不覆盖过滤本身(过滤逻辑由 review 读码确认 + 浏览器实测)。
+  // 23c AddForm:Esc 清空草稿(on:keydown.escape;此处直触 handler 验证清空效果)
+  const f = await fresh();
+  f.render("/");
+  f.fire(2, "未提交的草稿"); // 输入(bind:value,6 字)
+  check(f.has("6/80"), "/         输入草稿 → 字数 6/80");
+  f.fire(3); // on:keydown.escape 的 handler → 清空草稿
+  check(f.has("0/80") && !f.liveHas("6/80"), "/         Esc(on:keydown.escape)→ 清空草稿(字数回 0/80)");
+  // 分隔控制符剥除:value "x\x1fy" 应被剥成 "xy"(2 字),而非截断成 "x"(1 字)
+  f.fireEvent(2, { value: "x\x1fy" });
+  check(f.has("2/80") && !f.liveHas("1/80"), "/         输入含分隔控制符 → 被剥除不截断(x\\x1fy→xy,2 字)");
 }
 
 console.log(ok ? "✅ 全部通过" : "❌ 有失败");

@@ -32,7 +32,7 @@ enum Node {
 enum Attr {
     Static { name: String, value: LitStr },
     Dyn { name: String, block: syn::Block },     // name={expr}
-    Event { event: String, handler: syn::Block }, // on:<事件>={...}
+    Event { event: String, modifiers: Vec<String>, handler: syn::Block }, // on:<事件>[.修饰符]*={...}
     Bind { prop: String, expr: syn::Block },      // bind:<属性>={signal}(双向绑定)
     Ref { handle: syn::Block },                   // ref={node_ref}(把元素 id 写进句柄,配 on_mount)
 }
@@ -87,11 +87,23 @@ fn parse_node(input: ParseStream) -> syn::Result<Node> {
             // 前缀语法:on:<事件>={...} 事件处理;bind:<属性>={signal} 双向绑定。
             input.parse::<Token![:]>()?;
             let sub: Ident = input.parse()?;
+            // 事件修饰符:on:keydown.enter.prevent → 解析 `.标识符`*(prevent/stop/capture/passive/self
+            // + 按键过滤 enter/esc/space/up… 由 router.js 区分应用)。
+            let mut modifiers: Vec<String> = Vec::new();
+            while input.peek(Token![.]) {
+                input.parse::<Token![.]>()?;
+                modifiers.push(Ident::parse_any(input)?.to_string());
+            }
             input.parse::<Token![=]>()?;
             let block: syn::Block = input.parse()?;
             match name.to_string().as_str() {
-                "on" => attrs.push(Attr::Event { event: sub.to_string(), handler: block }),
-                "bind" => attrs.push(Attr::Bind { prop: sub.to_string(), expr: block }),
+                "on" => attrs.push(Attr::Event { event: sub.to_string(), modifiers, handler: block }),
+                "bind" => {
+                    if !modifiers.is_empty() {
+                        return Err(syn::Error::new(name.span(), "bind: 不支持修饰符(修饰符用于 on:<事件>)"));
+                    }
+                    attrs.push(Attr::Bind { prop: sub.to_string(), expr: block });
+                }
                 _ => return Err(syn::Error::new(name.span(), "前缀只支持 on:<事件> 或 bind:<属性>")),
             }
         } else {
@@ -515,10 +527,17 @@ fn gen_node(n: &Node) -> TS2 {
                         quote! { rui::dom::attr(__n, #name, &(#v)); }
                     }
                 }
-                Attr::Event { event, handler } => {
-                    // on:<事件>:把用户(零参)闭包包成忽略 payload 的 Fn(&str)。
+                Attr::Event { event, modifiers, handler } => {
+                    // on:<事件>[.修饰符]*:把用户(零参)闭包包成忽略 payload 的 Fn(&str);
+                    // 事件描述符 = "事件 修饰符*"(空格分隔)交给 dom::on → router.js 据此应用修饰符。
+                    // handler 内可用 rui::event() 取键盘/鼠标/files 等完整事件数据。
                     let h = unwrap_block(handler);
-                    quote! {{ let __h = #h; rui::dom::on(__n, #event, move |_: &str| __h()); }}
+                    let desc = if modifiers.is_empty() {
+                        event.clone()
+                    } else {
+                        format!("{} {}", event, modifiers.join(" "))
+                    };
+                    quote! {{ let __h = #h; rui::dom::on(__n, #desc, move |_: &str| __h()); }}
                 }
                 Attr::Ref { handle } => {
                     // 把刚创建 / 认领的元素 id 写进句柄;on_mount 里据此取真实节点。
@@ -538,10 +557,10 @@ fn gen_node(n: &Node) -> TS2 {
                                 { let __s = (#s).clone(); rui::dom::on(__n, #event, move |__v: &str| { if let ::std::result::Result::Ok(__x) = __v.parse() { __s.set(__x); } }); }
                             }}
                         }
-                        // 受控复选框(Signal<bool>):signal→.checked(effect)+ change 事件(payload "true"/"false")。
+                        // 受控复选框(Signal<bool>):signal→.checked(effect)+ change 事件读 event().checked。
                         "checked" => quote! {{
                             { let __s = (#s).clone(); rui::reactive::effect(move || rui::dom::set_checked(__n, __s.get())); }
-                            { let __s = (#s).clone(); rui::dom::on(__n, "change", move |__v: &str| __s.set(__v == "true")); }
+                            { let __s = (#s).clone(); rui::dom::on(__n, "change", move |_: &str| __s.set(rui::dom::event().checked)); }
                         }},
                         // 单选组(Signal<String>):checked = (signal == 本项 value);change → signal.set(本项 value)。
                         // 需配套 value="..."(从本元素自身的 value 属性取本 radio 的取值)。
