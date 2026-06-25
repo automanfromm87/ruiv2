@@ -37,10 +37,10 @@ pub fn serve_axum_with(app: App, cfg: AppConfig) {
 
 async fn run(app: App) {
     let c = config();
-    // 资源路由 / bind / body 上限来自 cfg(可配置宿主);/graphql 端点固定(协议入口)。
+    // 全部入口路由(协议 + 资源)+ bind + body 上限都来自 cfg(可配置宿主,单一真相源)。
     let router = Router::new()
-        .route("/graphql", post(graphql)) // POST-only(GET mutation → 405,修了 std 的 method 不校验)
-        .route("/graphql/subscribe", get(subscribe))
+        .route(c.assets.graphql_route.as_str(), post(graphql)) // POST-only(GET mutation → 405)
+        .route(c.assets.subscribe_route.as_str(), get(subscribe))
         .route(c.assets.router_js_route.as_str(), get(router_js))
         .route(c.assets.wasm_route.as_str(), get(app_wasm))
         .route(c.assets.css_route.as_str(), get(styles_css))

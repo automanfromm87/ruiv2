@@ -57,12 +57,12 @@ pub struct App {
 //    进程级 OnceLock(一服务一配置,启动设一次、只读;同 RESOLVE 模式)。所有字段 Default = 当前字面量,
 //    故零配置 serve(app) / serve_axum(app) 行为字节不变;serve_with / serve_axum_with 传自定义。两后端共享同一份配置。
 
-/// 默认 wasm 路由(单一真相源:AssetMap::default 与 default_shell 的"是否注入 window.__rui_wasm"判定共用)。
-const DEFAULT_WASM_ROUTE: &str = "/app.wasm";
-
-/// 静态资源的路由 + 磁盘路径映射(路由名与磁盘文件名都可改)。
+/// 宿主的全部入口映射:协议入口(graphql/subscribe)+ 静态资源(router.js/wasm/css)路由 + 磁盘路径。
+/// 这是宿主入口的**单一真相源** —— 服务端据此路由,客户端经 default_shell 注入的 window.__rui 读同一份(贯穿两端)。
 #[derive(Clone)]
 pub struct AssetMap {
+    pub graphql_route: String,   // 默认 "/graphql"(POST 查询/变更)
+    pub subscribe_route: String, // 默认 "/graphql/subscribe"(SSE 订阅)
     pub router_js_route: String, // 默认 "/router.js"(内嵌 glue)
     pub wasm_route: String,      // 默认 "/app.wasm"
     pub wasm_disk: String,       // 默认 "web/app.wasm"
@@ -72,8 +72,10 @@ pub struct AssetMap {
 impl Default for AssetMap {
     fn default() -> Self {
         AssetMap {
+            graphql_route: "/graphql".into(),
+            subscribe_route: "/graphql/subscribe".into(),
             router_js_route: "/router.js".into(),
-            wasm_route: DEFAULT_WASM_ROUTE.into(),
+            wasm_route: "/app.wasm".into(),
             wasm_disk: "web/app.wasm".into(),
             css_route: "/styles.css".into(),
             css_disk: "web/styles.css".into(),
@@ -83,11 +85,14 @@ impl Default for AssetMap {
 
 /// HTML 外壳渲染上下文(默认外壳 default_shell 用;自定义 shell 据此拼整页)。
 pub struct ShellCtx<'a> {
-    pub app_html: &'a str,   // SSR 片段(空 = CSR 空壳)
-    pub data: &'a str,       // 注入的脱水数据 JSON
-    pub css_href: &'a str,   // <link> href(= assets.css_route)
-    pub router_src: &'a str, // <script src>(= assets.router_js_route)
-    pub wasm_route: &'a str, // 客户端 wasm 路由(非默认时注入 window.__rui_wasm 供 router.js 读)
+    pub app_html: &'a str,        // SSR 片段(空 = CSR 空壳)
+    pub data: &'a str,            // 注入的脱水数据 JSON
+    pub css_href: &'a str,        // <link> href(= assets.css_route)
+    pub router_src: &'a str,      // <script src>(= assets.router_js_route)
+    // 以下三项注入 window.__rui 供客户端 router.js 读(协议/wasm 入口的单一真相源,贯穿服务端配置)。
+    pub wasm_route: &'a str,      // = assets.wasm_route
+    pub graphql_route: &'a str,   // = assets.graphql_route
+    pub subscribe_route: &'a str, // = assets.subscribe_route
 }
 
 /// 宿主配置。所有字段 Default = 当前行为(零配置 serve 字节不变)。
@@ -119,8 +124,8 @@ pub(crate) fn set_config(cfg: AppConfig) {
     // 校验资源路由互不冲突、也不撞协议端点。否则两后端行为分歧:axum 启动 panic(Router 重复路由),
     // std 静默首匹配(if/else 链先中先用)。这里统一在设配置时 loud 失败,两后端一致、尽早暴露。
     let routes = [
-        "/graphql",
-        "/graphql/subscribe",
+        cfg.assets.graphql_route.as_str(),
+        cfg.assets.subscribe_route.as_str(),
         cfg.assets.router_js_route.as_str(),
         cfg.assets.wasm_route.as_str(),
         cfg.assets.css_route.as_str(),
@@ -129,7 +134,7 @@ pub(crate) fn set_config(cfg: AppConfig) {
         for j in (i + 1)..routes.len() {
             assert!(
                 routes[i] != routes[j],
-                "rui: AppConfig 资源路由冲突 `{}` —— /graphql · /graphql/subscribe · router_js · wasm · css 须各异",
+                "rui: AppConfig 入口路由冲突 `{}` —— graphql · subscribe · router_js · wasm · css 须各异",
                 routes[i]
             );
         }
@@ -137,23 +142,24 @@ pub(crate) fn set_config(cfg: AppConfig) {
     let _ = CONFIG.set(cfg); // 启动设一次(serve_with / serve_axum_with);重复设忽略
 }
 
-/// 默认整页骨架(= 原 doc())。css_href / router_src 来自 AssetMap;wasm_route 非默认时注入 window.__rui_wasm
-/// (默认时不注入 → 与历史输出字节一致,router.js 缺省 fallback `/app.wasm`)。
+/// 默认整页骨架。css_href / router_src 进 <link>/<script src>(服务端链接);wasm/graphql/subscribe 路由统一注入
+/// `window.__rui` 供客户端 router.js 读 —— 宿主入口(协议 + 资源)单一真相源贯穿两端,不再有客户端硬编码地址。
 pub fn default_shell(c: &ShellCtx) -> String {
-    let wasm_inject = if c.wasm_route == DEFAULT_WASM_ROUTE {
-        String::new()
-    } else {
-        // 转义 `\` / `"` / `</`:防自定义 wasm_route 破坏 <script> 字符串或提前闭合标签。
-        let safe = c.wasm_route.replace('\\', "\\\\").replace('"', "\\\"").replace("</", "<\\/");
-        format!("<script>window.__rui_wasm=\"{}\"</script>", safe)
-    };
+    // 转义 `\` / `"` / `</`:防路由串破坏 <script> 字符串或提前闭合标签。
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace("</", "<\\/");
+    let rui_cfg = format!(
+        "<script>window.__rui={{wasm:\"{}\",graphql:\"{}\",subscribe:\"{}\"}}</script>",
+        esc(c.wasm_route),
+        esc(c.graphql_route),
+        esc(c.subscribe_route),
+    );
     format!(
         "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <title>rui</title><style>rui-slot,rui-frag{{display:contents}}</style>\
 <link rel=\"stylesheet\" href=\"{css}\"></head>\
 <body><div id=\"app\">{app}</div>\
-<script id=\"__rui_data\" type=\"application/json\">{data}</script>{wasm_inject}\
+<script id=\"__rui_data\" type=\"application/json\">{data}</script>{rui_cfg}\
 <script type=\"module\" src=\"{router}\"></script></body></html>",
         css = c.css_href,
         app = c.app_html,
@@ -304,8 +310,8 @@ fn handle(mut s: TcpStream, app: App) {
     };
 
     // ── subscription:SSE 长连接(本线程独占,循环推送)──
-    // 精确匹配(== 而非 starts_with):与 axum 的 .route 精确路由一致,/graphql/subscribe/x 等落到统一 SSR/资源分发。
-    if path == "/graphql/subscribe" {
+    // 精确匹配(== 而非 starts_with):与 axum 的 .route 精确路由一致;路由名来自 cfg(可配置宿主)。
+    if path == cfg.assets.subscribe_route {
         if let Some(sse) = app.sse {
             let _ = s.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
@@ -325,7 +331,7 @@ fn handle(mut s: TcpStream, app: App) {
     // (resolver 的字段级 panic 已在 exec 内隔离成 errors[];这里兜的是渲染期等其它 panic。)
     // 资源路由 / 磁盘路径 / router.js 内容均来自 cfg(可配置宿主);/graphql 端点固定(协议入口)。
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (&str, &str, Vec<u8>) {
-        if path == "/graphql" {
+        if path == cfg.assets.graphql_route {
             // POST-only(对齐 axum):GET mutation 是 CSRF 向量,非 POST → 405。
             if method != "POST" {
                 ("405 Method Not Allowed", "application/json; charset=utf-8", br#"{"data":null,"errors":[{"message":"method not allowed"}]}"#.to_vec())
@@ -437,6 +443,8 @@ fn doc(app_html: &str, data: &str) -> String {
         css_href: &cfg.assets.css_route,
         router_src: &cfg.assets.router_js_route,
         wasm_route: &cfg.assets.wasm_route,
+        graphql_route: &cfg.assets.graphql_route,
+        subscribe_route: &cfg.assets.subscribe_route,
     })
 }
 
@@ -538,11 +546,14 @@ mod config_tests {
             css_href: &a.css_route,
             router_src: &a.router_js_route,
             wasm_route: &a.wasm_route,
+            graphql_route: &a.graphql_route,
+            subscribe_route: &a.subscribe_route,
         })
     }
 
     #[test]
-    fn default_shell_byte_identical_to_legacy() {
+    fn default_shell_injects_host_config() {
+        // 默认 shell:静态骨架不变 + 统一注入 window.__rui(协议/wasm 入口的客户端真相源,贯穿服务端配置)。
         let html = shell_with(&AssetMap::default(), "<p>x</p>", "{\"q\":1}");
         let expected = "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -550,9 +561,9 @@ mod config_tests {
 <link rel=\"stylesheet\" href=\"/styles.css\"></head>\
 <body><div id=\"app\"><p>x</p></div>\
 <script id=\"__rui_data\" type=\"application/json\">{\"q\":1}</script>\
+<script>window.__rui={wasm:\"/app.wasm\",graphql:\"/graphql\",subscribe:\"/graphql/subscribe\"}</script>\
 <script type=\"module\" src=\"/router.js\"></script></body></html>";
-        assert_eq!(html, expected, "默认 shell 与历史 doc() 字节不一致(零配置回归)");
-        assert!(!html.contains("__rui_wasm"), "默认 wasm 路由不应注入全局(保字节一致)");
+        assert_eq!(html, expected, "默认 shell(含 window.__rui 注入)不符");
     }
 
     #[test]
@@ -581,16 +592,23 @@ mod config_tests {
 
     #[test]
     fn custom_config_honored() {
+        // 自定义入口(含挂前缀场景:/app1/...)→ 服务端链接 + 客户端 window.__rui 都反映,单一真相源贯穿两端。
         let a = AssetMap {
-            css_route: "/assets/app.css".into(),
-            router_js_route: "/static/glue.js".into(),
-            wasm_route: "/static/app.wasm".into(),
+            css_route: "/app1/styles.css".into(),
+            router_js_route: "/app1/router.js".into(),
+            wasm_route: "/app1/app.wasm".into(),
+            graphql_route: "/app1/graphql".into(),
+            subscribe_route: "/app1/graphql/subscribe".into(),
             ..AssetMap::default()
         };
         let html = shell_with(&a, "", "");
-        assert!(html.contains("href=\"/assets/app.css\""), "自定义 css 路由应进 <link>");
-        assert!(html.contains("src=\"/static/glue.js\""), "自定义 router 路由应进 <script>");
-        assert!(html.contains("window.__rui_wasm=\"/static/app.wasm\""), "非默认 wasm 路由应注入全局供 router.js 读");
+        assert!(html.contains("href=\"/app1/styles.css\""), "自定义 css 路由应进 <link>");
+        assert!(html.contains("src=\"/app1/router.js\""), "自定义 router 路由应进 <script src>");
+        // 协议入口打穿到客户端:window.__rui 三项都用自定义路由(router.js 据此请求,不再去根路径)
+        assert!(
+            html.contains("window.__rui={wasm:\"/app1/app.wasm\",graphql:\"/app1/graphql\",subscribe:\"/app1/graphql/subscribe\"}"),
+            "自定义协议/wasm 入口应注入 window.__rui 供客户端读"
+        );
         // 默认字面量回归(bind / body_limit)
         let d = AppConfig::default();
         assert_eq!(d.bind, ("127.0.0.1".to_string(), 8084));

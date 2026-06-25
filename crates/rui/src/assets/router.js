@@ -75,7 +75,7 @@ const env = {
   // GraphQL query/mutation:POST /graphql,响应回 on_fetch。网络失败 → 注入 errors 让 UI 进 error 态(否则 loading 永真)。
   gql_query: (qPtr, qLen, handler) => {
     const query = str(qPtr, qLen);
-    fetch("/graphql", { method: "POST", body: query })
+    fetch((window.__rui && window.__rui.graphql) || "/graphql", { method: "POST", body: query })
       // 非 2xx(500/502/404 等,体可能是 HTML/纯文本)→ 合成 errors,别当成功响应(否则会把垃圾当数据)。
       .then((r) => (r.ok ? r.text() : r.text().then((t) => JSON.stringify({ errors: [{ message: "HTTP " + r.status + ":" + t.slice(0, 200) }] }))))
       .then((text) => deliver(handler, text))
@@ -84,7 +84,8 @@ const env = {
   // GraphQL subscription:开 SSE,每次推送都回 on_fetch(同一 handler 反复调用)。
   gql_subscribe: (qPtr, qLen, handler) => {
     const q = str(qPtr, qLen);
-    const es = new EventSource("/graphql/subscribe?q=" + encodeURIComponent(q));
+    const subUrl = (window.__rui && window.__rui.subscribe) || "/graphql/subscribe";
+    const es = new EventSource(subUrl + "?q=" + encodeURIComponent(q));
     es.onmessage = (e) => deliver(handler, e.data);
     // 连接彻底断开(非瞬时重连)才报错,避免 EventSource 自动重连的瞬时 error 刷屏。
     es.onerror = () => { if (es.readyState === EventSource.CLOSED) deliver(handler, JSON.stringify({ errors: [{ message: "订阅连接中断" }] })); };
@@ -113,8 +114,9 @@ const env = {
   console_error: (p, l) => console.error(str(p, l)), // panic hook:wasm panic 消息打到 console
 };
 
-// wasm 路由可配:默认 /app.wasm;自定义 wasm_route 时 shell 注入 window.__rui_wasm(见 AppConfig::assets)。
-const bytes = await fetch(window.__rui_wasm || "/app.wasm").then((r) => r.arrayBuffer());
+// 宿主入口由 shell 注入的 window.__rui 提供(协议 graphql/subscribe + 资源 wasm,均源自 AppConfig::assets,
+// 贯穿服务端配置);缺省 fallback 到根路径默认值(无注入时仍可用)。
+const bytes = await fetch((window.__rui && window.__rui.wasm) || "/app.wasm").then((r) => r.arrayBuffer());
 const { instance } = await WebAssembly.instantiate(bytes, { env });
 wasm = instance.exports;
 mem = wasm.memory;
