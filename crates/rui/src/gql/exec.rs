@@ -96,21 +96,76 @@ pub fn empty_resolver(_kind: OpKind, _field: &str, _args: &Args) -> Value {
     Value::Null
 }
 
+// ── 错误收集(本次执行的 GraphQL errors[];线程局部 = 每连接一线程,天然请求隔离)──
+thread_local! {
+    static ERRORS: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CUR_FIELD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// resolver 主动报一个 GraphQL 错误:进本次响应的 `errors[]`(path 取当前根字段);该字段通常返回空/默认值。
+/// 让 resolver 不改返回类型也能「失败一个字段」(如「未找到」「无权限」「校验失败」)。仅服务端执行期有效。
+pub fn report_error(message: impl Into<String>) {
+    let field = CUR_FIELD.with(|f| f.borrow().clone());
+    push_error(message.into(), &field);
+}
+
+fn push_error(message: String, field: &str) {
+    let mut obj = vec![("message".to_string(), Value::Str(message))];
+    if !field.is_empty() {
+        obj.push(("path".to_string(), Value::List(vec![Value::Str(field.to_string())])));
+    }
+    ERRORS.with(|e| e.borrow_mut().push(Value::Object(obj)));
+}
+
+fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "resolver panicked".to_string()
+    }
+}
+
 /// 执行一个 GraphQL 文档,返回标准 JSON 响应字符串。
+/// 每个根字段独立隔离:resolver panic 被 catch_unwind 兜住 → 进 errors[] + 该字段 data=null、其余字段照常
+/// (标准 GraphQL partial data + errors)。resolver 也可调 `report_error` 主动报错。
 pub fn execute(req: &str, resolve: Resolver) -> String {
+    // 本次执行的错误集(同线程复用前清空)。前提:execute 同线程不可重入 —— 每次 execute 末尾 drain 并清空,
+    // thread-per-conn + resolver 返回 Value(不回调 execute)保证了这点;若将来引入 async / 嵌套执行需另设计。
+    ERRORS.with(|e| e.borrow_mut().clear());
     let doc = parser::parse(req);
+    // 粗粒度解析失败:非空请求却零 operation → 报一个解析错误(精细定位需 parser 带错误通道,后续)。
+    if doc.ops.is_empty() && !req.trim().is_empty() {
+        push_error("无法解析 GraphQL 查询".to_string(), "");
+    }
     let mut data: Vec<(String, Value)> = Vec::new();
     for op in &doc.ops {
         for f in &op.selection {
             let args = Args(&f.args);
-            let raw = resolve(op.kind, &f.name, &args);
             let key = f.alias.clone().unwrap_or_else(|| f.name.clone());
-            data.push((key, project(&raw, &f.selection)));
+            CUR_FIELD.with(|cf| *cf.borrow_mut() = f.name.clone()); // 供 report_error / panic 取 path
+            // 隔离 resolver + 投影的 panic:都包进 catch_unwind(project 在 catch 外则它 panic 会逃逸杀连接)。
+            // panic 不杀线程、转成 errors[] 条目 + 该字段 null,其余字段照常(标准 partial data)。
+            // 注:AssertUnwindSafe 只是「保证 panic 安全」的承诺 —— resolver 持锁 panic 仍会毒化该 Mutex,
+            // 由 resolver 侧用 `lock().unwrap_or_else(|e| e.into_inner())` 恢复(见 examples 的 todos.rs)。
+            let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                project(&resolve(op.kind, &f.name, &args), &f.selection)
+            }));
+            let val = match resolved {
+                Ok(v) => v,
+                Err(p) => {
+                    push_error(format!("字段 {} 执行出错:{}", f.name, panic_message(p)), &f.name);
+                    Value::Null
+                }
+            };
+            data.push((key, val));
         }
     }
+    let errors = ERRORS.with(|e| std::mem::take(&mut *e.borrow_mut()));
     Value::Object(vec![
         ("data".to_string(), Value::Object(data)),
-        ("errors".to_string(), Value::List(Vec::new())),
+        ("errors".to_string(), Value::List(errors)),
     ])
     .to_json()
 }
@@ -144,5 +199,55 @@ fn project(v: &Value, sel: &[Field]) -> Value {
             Value::Object(out)
         }
         _ => v.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gql::parser::OpKind;
+
+    fn resolver(_k: OpKind, field: &str, _a: &Args) -> Value {
+        match field {
+            "ok" => Value::Object(vec![("id".to_string(), Value::Str("1".to_string()))]),
+            "boom" => panic!("kaboom"),
+            "reported" => {
+                report_error("未找到");
+                Value::Null
+            }
+            _ => Value::Null,
+        }
+    }
+
+    #[test]
+    fn clean_query_has_empty_errors() {
+        let out = execute("{ ok { id } }", resolver);
+        assert!(out.contains("\"errors\":[]"), "{out}");
+        assert!(out.contains("\"id\":\"1\""), "{out}");
+    }
+
+    #[test]
+    fn panic_field_isolated_into_errors() {
+        // boom 字段 panic 被隔离:进 errors[]、该字段 null,ok 字段照常(partial data)。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 静音预期内 panic 输出
+        let out = execute("{ ok { id } boom { id } }", resolver);
+        std::panic::set_hook(prev);
+        assert!(out.contains("kaboom"), "errors 应含 panic 消息: {out}");
+        assert!(out.contains("\"id\":\"1\""), "ok 字段应照常: {out}");
+        assert!(out.contains("\"boom\":null"), "panic 字段应为 null: {out}");
+    }
+
+    #[test]
+    fn report_error_surfaces() {
+        let out = execute("{ reported { id } }", resolver);
+        assert!(out.contains("未找到"), "report_error 应进 errors[]: {out}");
+        assert!(!out.contains("\"errors\":[]"), "errors 不应为空: {out}");
+    }
+
+    #[test]
+    fn parse_failure_reports_error() {
+        let out = execute("not a valid query", resolver);
+        assert!(out.contains("无法解析"), "解析失败应报错: {out}");
     }
 }

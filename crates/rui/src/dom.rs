@@ -457,6 +457,7 @@ mod backend {
         HID.with(|h| h.set(0));
         DOC_ROOT.with(|d| d.set(None));
         SSR_RESP.with(|r| r.borrow_mut().clear());
+        FETCH_HANDLERS.with(|h| h.borrow_mut().clear()); // query!/resource! 回调随渲染累积:复用线程时必清,否则只增不减
     }
     pub fn take_html() -> String {
         let mut s = String::new();

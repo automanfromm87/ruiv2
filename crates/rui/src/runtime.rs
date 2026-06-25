@@ -154,6 +154,15 @@ pub fn set_current_query(query: &str) {
     set_query(query);
 }
 
+/// SSR 每渲染前清 PATH/QUERY 的订阅表(它们是跨渲染持久的全局 Signal)。配合 reactive::reset():
+/// 复用线程 + 重用 effect id 时,持久 signal 残留的旧订阅 id 会与新 id 碰撞、破坏订阅 —— 故必须清。
+/// 一连接一线程下线程会死、无害(本就是空的)。
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn reset_route_signals() {
+    PATH.with(|p| p.clear_subs());
+    QUERY.with(|q| q.clear_subs());
+}
+
 // ── 生命周期:on_mount(节点入 DOM 后执行,仅客户端)──
 // 在 render / 事件 / fetch / 定时器期间排队,等本次同步重建跑完(节点已进 DOM)统一 flush。
 // 服务端无 DOM → on_mount 整体 no-op。flush 在所有 wasm 入口尾部调用,故动态子树(<Show>/<For>

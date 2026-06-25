@@ -33,13 +33,13 @@ fn next_id() -> String {
 // ── 数据访问(schema 的 resolver 方法调用)──
 
 pub fn all() -> Vec<Todo> {
-    store().lock().unwrap().clone()
+    store().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 pub fn add(text: &str) -> Vec<Todo> {
     let text = text.trim();
     if !text.is_empty() {
-        store().lock().unwrap().push(Todo { id: next_id(), text: text.to_string(), done: false });
+        store().lock().unwrap_or_else(|e| e.into_inner()).push(Todo { id: next_id(), text: text.to_string(), done: false });
         broadcast();
     }
     all()
@@ -47,7 +47,7 @@ pub fn add(text: &str) -> Vec<Todo> {
 
 pub fn toggle(id: &str) -> Vec<Todo> {
     {
-        let mut v = store().lock().unwrap();
+        let mut v = store().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = v.iter_mut().find(|t| t.id == id) {
             t.done = !t.done;
         }
@@ -57,20 +57,20 @@ pub fn toggle(id: &str) -> Vec<Todo> {
 }
 
 pub fn remove(id: &str) -> Vec<Todo> {
-    store().lock().unwrap().retain(|t| t.id != id);
+    store().lock().unwrap_or_else(|e| e.into_inner()).retain(|t| t.id != id);
     broadcast();
     all()
 }
 
 pub fn clear_done() -> Vec<Todo> {
-    store().lock().unwrap().retain(|t| !t.done);
+    store().lock().unwrap_or_else(|e| e.into_inner()).retain(|t| !t.done);
     broadcast();
     all()
 }
 
 pub fn complete_all() -> Vec<Todo> {
     {
-        let mut v = store().lock().unwrap();
+        let mut v = store().lock().unwrap_or_else(|e| e.into_inner());
         for t in v.iter_mut() {
             t.done = true;
         }
@@ -81,7 +81,7 @@ pub fn complete_all() -> Vec<Todo> {
 
 /// Relay 游标分页(归档页):cursor = id;after 为上一页最后一个 id(空 = 第一页)。
 pub fn page(first: i64, after: &str) -> Vec<TodoConnection> {
-    let all = store().lock().unwrap().clone();
+    let all = store().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let start = if after.is_empty() {
         0
     } else {
@@ -97,7 +97,7 @@ pub fn page(first: i64, after: &str) -> Vec<TodoConnection> {
 
 /// 单条详情(/todo/:id):按 id 查,命中返回 1 条、否则空。
 pub fn detail(id: &str) -> Vec<Todo> {
-    store().lock().unwrap().iter().filter(|t| t.id == id).cloned().collect()
+    store().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|t| t.id == id).cloned().collect()
 }
 
 /// 服务端按文本过滤(resource! 搜索演示):空串返回空。
@@ -106,14 +106,14 @@ pub fn search(q: &str) -> Vec<Todo> {
     if q.is_empty() {
         return Vec::new();
     }
-    store().lock().unwrap().iter().filter(|t| t.text.contains(q)).cloned().collect()
+    store().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|t| t.text.contains(q)).cloned().collect()
 }
 
 // ── 订阅 / SSE ──
 
 /// SSE 推送 / 初值:标准 `{"data":{"todo_updates":[全字段]}}`。
 pub fn snapshot_json() -> String {
-    let todos = store().lock().unwrap().clone();
+    let todos = store().lock().unwrap_or_else(|e| e.into_inner()).clone();
     Value::Object(vec![(
         "data".to_string(),
         Value::Object(vec![("todo_updates".to_string(), todos.into_value())]),
@@ -123,11 +123,11 @@ pub fn snapshot_json() -> String {
 
 pub fn add_subscriber() -> Receiver<String> {
     let (tx, rx) = channel();
-    subs().lock().unwrap().push(tx);
+    subs().lock().unwrap_or_else(|e| e.into_inner()).push(tx);
     rx
 }
 
 fn broadcast() {
     let json = snapshot_json();
-    subs().lock().unwrap().retain(|tx| tx.send(json.clone()).is_ok());
+    subs().lock().unwrap_or_else(|e| e.into_inner()).retain(|tx| tx.send(json.clone()).is_ok());
 }

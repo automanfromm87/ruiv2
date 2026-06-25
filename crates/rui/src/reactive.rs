@@ -46,6 +46,21 @@ thread_local! {
     static BATCH: Cell<u32> = const { Cell::new(0) };
 }
 
+/// 把整个反应式竞技场清回初始态。**仅供 SSR 服务端「每次渲染前」调用**:
+/// 线程池复用线程时,`EFFECTS`(只增不减、原本靠线程死亡整体回收)会跨渲染累积 → 必须手动清空。
+/// std「一连接一线程」模型线程会死、无需它(调了也只是清空本就空的竞技场,无害)。
+/// 客户端(浏览器单线程长生 app)**勿调** —— 会清掉当前 app 的全部 effect/context。
+pub fn reset() {
+    CURRENT.with(|c| c.set(None));
+    EFFECTS.with(|e| e.borrow_mut().clear());
+    OWNER.with(|o| o.borrow_mut().clear());
+    CLEANUPS.with(|c| c.borrow_mut().clear());
+    CONTEXTS.with(|c| c.borrow_mut().clear());
+    PENDING.with(|p| p.borrow_mut().clear());
+    FLUSHING.with(|f| f.set(false));
+    BATCH.with(|b| b.set(0));
+}
+
 /// 注册一个卸载回调:当前 `scope`(页面 / 子树)被销毁时执行 —— 清定时器 / 解绑 / 销毁第三方实例。
 /// 不在任何 scope 内调用则忽略(无归属)。服务端:scope 渲染后即 drop,回调随之执行(DOM 操作是 no-op)。
 pub fn on_cleanup(f: impl FnOnce() + 'static) {
@@ -126,6 +141,15 @@ pub struct Signal<T> {
 impl<T> Clone for Signal<T> {
     fn clone(&self) -> Self {
         Signal { inner: self.inner.clone(), subs: self.subs.clone(), src_height: self.src_height.clone() }
+    }
+}
+
+impl<T> Signal<T> {
+    /// 清空订阅者表。仅用于「跨渲染持久」的 Signal(如 runtime 的 PATH/QUERY):服务端复用线程 +
+    /// reactive::reset() 重用 effect id 时,这类持久 signal 的旧订阅 id 会与新 id 碰撞 → 必须每渲染清。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn clear_subs(&self) {
+        self.subs.borrow_mut().clear();
     }
 }
 

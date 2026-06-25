@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use std::thread;
 
 // 框架内嵌的客户端 glue(所有 rui app 通用):wasm 加载 + ffi + SPA 导航。
-const ROUTER_JS: &str = include_str!("assets/router.js");
+pub(crate) const ROUTER_JS: &str = include_str!("assets/router.js");
 
 // ── 同构本地执行(native 端 dom::gql 用)──
 
@@ -66,6 +66,8 @@ pub fn serve(app: App) {
 
 /// 服务端渲染一个 Page 的 render 闭包,产出 HTML 片段(同构,query! 本地预取带数据)。
 fn render_page(p: crate::view::Page) -> String {
+    crate::reactive::reset(); // 清反应式竞技场(EFFECTS 只增不减):线程池复用线程时必需;std 线程会死、是 no-op
+    crate::runtime::reset_route_signals(); // 清 PATH/QUERY 持久 signal 的订阅表(配合 reset 的 id 重用)
     crate::dom::reset();
     crate::gql::store::reset(); // 清空规范化缓存,保证请求间隔离
     let render = p.render;
@@ -142,17 +144,29 @@ fn handle(mut s: TcpStream, app: App) {
         return;
     }
 
-    let (status, ctype, body): (&str, &str, Vec<u8>) = if path == "/graphql" {
-        let q = req.split("\r\n\r\n").nth(1).unwrap_or("");
-        ("200 OK", "application/json; charset=utf-8", exec::execute(q, app.resolve).into_bytes())
-    } else if path == "/router.js" {
-        ("200 OK", "text/javascript; charset=utf-8", ROUTER_JS.as_bytes().to_vec())
-    } else if path == "/app.wasm" {
-        file("web/app.wasm", "application/wasm")
-    } else if path == "/styles.css" {
-        file("web/styles.css", "text/css; charset=utf-8")
-    } else {
-        ("200 OK", "text/html; charset=utf-8", page(app.route, path, query).into_bytes())
+    // 包 catch_unwind:GraphQL 执行 / SSR 渲染里的 panic 不再静默丢连接,而是回 500 + 打日志。
+    // (resolver 的字段级 panic 已在 exec 内隔离成 errors[];这里兜的是渲染期等其它 panic。)
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (&str, &str, Vec<u8>) {
+        if path == "/graphql" {
+            let q = req.split("\r\n\r\n").nth(1).unwrap_or("");
+            ("200 OK", "application/json; charset=utf-8", exec::execute(q, app.resolve).into_bytes())
+        } else if path == "/router.js" {
+            ("200 OK", "text/javascript; charset=utf-8", ROUTER_JS.as_bytes().to_vec())
+        } else if path == "/app.wasm" {
+            file("web/app.wasm", "application/wasm")
+        } else if path == "/styles.css" {
+            file("web/styles.css", "text/css; charset=utf-8")
+        } else {
+            ("200 OK", "text/html; charset=utf-8", page(app.route, path, query).into_bytes())
+        }
+    }));
+    let (status, ctype, body): (&str, &str, Vec<u8>) = match built {
+        Ok(t) => t,
+        Err(p) => {
+            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown".to_string());
+            eprintln!("rui: 请求处理 panic({path}):{msg}");
+            ("500 Internal Server Error", "text/plain; charset=utf-8", b"internal server error".to_vec())
+        }
     };
 
     let header = format!(
@@ -174,7 +188,7 @@ fn file(p: &str, ctype: &'static str) -> (&'static str, &'static str, Vec<u8>) {
 //   Ssr    渲染 + 注入数据(客户端水合)
 //   Csr    只发空壳(#app 为空、无数据)→ 客户端探测到无 SSR 内容,走纯 CSR
 //   Static 首次按 Ssr 渲染后按 path 缓存,后续直接复用
-fn page(route: fn(&str) -> crate::view::Page, path: &str, query: &str) -> String {
+pub(crate) fn page(route: fn(&str) -> crate::view::Page, path: &str, query: &str) -> String {
     use crate::view::Strategy;
     crate::runtime::set_current_path(path); // path 参数:让首屏 param() 读到正确段
     crate::runtime::set_current_query(query); // query 参数:让首屏 query_param() 读到正确值
@@ -193,12 +207,12 @@ fn page(route: fn(&str) -> crate::view::Page, path: &str, query: &str) -> String
                 parts.sort_unstable();
                 format!("{path}?{}", parts.join("&"))
             };
-            if let Some(h) = cache.lock().unwrap().get(&key) {
+            if let Some(h) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
                 return h.clone();
             }
             let html = ssr_doc(pg);
             // 上限保护:防任意 query 串(?utm=.. 等)无界增长 / 缓存洪泛;满了就停止缓存(继续按需渲染)。
-            let mut map = cache.lock().unwrap();
+            let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
             if map.len() < 1024 {
                 map.insert(key, html.clone());
             }

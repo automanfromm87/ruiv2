@@ -32,6 +32,10 @@ pub use runtime::on_mount;
 pub use reactive::{provide_context, provider, use_context};
 // batch:合并多次 set 为一次 flush(事件入口已自动 batch)。
 pub use reactive::batch;
+// GraphQL resolver 主动报错(服务端):在 #[gql_root] 方法体里调 `rui::report_error("..")` → 进响应 errors[]
+//(该字段返回空/默认即可)。resolver panic 也会被执行器隔离成 errors[] + 该字段 null,不再静默吞掉。
+#[cfg(not(target_arch = "wasm32"))]
+pub use gql::exec::report_error;
 // 路由:`param(i)`/`param_as::<T>(i)` 读 path 第 i 段(reactive,通常由 `#[rui::page]` 据模式串自动接);
 // `query_param("k")`/`query_param_as::<T>("k")` 读 `?k=`(在 body 里按需读,独立于 path);
 // `path()`/`query_string()` 原始 signal;`go` 程序化导航(pushState);`matches` 给 `router!` 分发。
@@ -41,6 +45,12 @@ pub use runtime::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod server;
+
+// 生产 HTTP 后端(feature = "axum"):rui::serve_axum(App)。仅非 wasm。
+#[cfg(all(not(target_arch = "wasm32"), feature = "axum"))]
+pub mod server_axum;
+#[cfg(all(not(target_arch = "wasm32"), feature = "axum"))]
+pub use server_axum::serve_axum;
 
 // 宏:应用直接用 rui::view! / rui::query! / #[derive(rui::GqlObject)] / #[rui::gql_root(..)] 等。
 pub use rui_macros::{

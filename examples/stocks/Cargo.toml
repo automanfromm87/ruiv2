@@ -10,6 +10,10 @@ crate-type = ["cdylib", "rlib"]
 rui = { path = "../../crates/rui" }
 rui-macros = { path = "../../crates/rui-macros" }
 
+# axum 生产后端只对 native(SSR bin)启用 —— wasm 客户端不拉 axum/tokio(零依赖不变)。
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rui = { path = "../../crates/rui", features = ["axum"] }
+
 [[bin]]
 name = "ssr"
 path = "src/bin/ssr.rs"

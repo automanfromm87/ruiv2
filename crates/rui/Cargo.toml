@@ -5,3 +5,14 @@ edition = "2021"
 
 [dependencies]
 rui-macros = { path = "../rui-macros" }
+
+# 生产 HTTP 后端(可选,feature = "axum")。仅非 wasm 目标拉取 → 默认/客户端仍零依赖、wasm 不受影响。
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "sync", "signal", "time"] }
+tokio-stream = { version = "0.1", optional = true }
+
+[features]
+# 启用后可用 rui::serve_axum(生产网络栈:有界并发 / 优雅关闭 / body 上限 / SSE keep-alive)。
+# 不启用则只有零依赖的 std rui::serve。
+axum = ["dep:axum", "dep:tokio", "dep:tokio-stream"]
