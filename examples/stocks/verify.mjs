@@ -11,6 +11,7 @@ async function fresh() {
   let clearAppCalls = 0; // SPA 换页才 clear_app;同页换参数不应触发(据此验证"不重建")
   const focused = []; // on_mount 命令式聚焦记录
   const intervals = []; // set_interval 记录({ms,h})
+  const timeouts = []; // set_timeout 记录({ms,h})—— 过渡的延时移除,测试手动触发
   const cleared = []; // clear_interval 记录(on_cleanup 验证)
   let timerSeq = 0;
   const jsRun = []; // run_js / run_js_on 记录(逃生舱)
@@ -28,6 +29,10 @@ async function fresh() {
     remove_child: (par, ch) => detach(ch),
     set_attr: (id, np, nl, vp, vl) => { (nodes[id].attrs ||= {})[str(np, nl)] = str(vp, vl); },
     set_value: (id, p, l) => { nodes[id].value = str(p, l); },
+    set_checked: (id, on) => { if (nodes[id]) nodes[id].checked = !!on; }, // 受控复选框/单选
+    add_class: (id, p, l) => { const n = nodes[id]; if (n) (n.cls ||= new Set()).add(str(p, l)); }, // 过渡 enter/leave 类
+    remove_class: (id, p, l) => { const n = nodes[id]; if (n && n.cls) n.cls.delete(str(p, l)); },
+    set_timeout: (ms, h) => { timeouts.push({ ms, h }); }, // 记录,测试手动 runTimeouts 触发(控制时序)
     add_event: () => {},
     clear_children: (id) => { if (nodes[id]) nodes[id].children = []; },
     gql_query: (qp, ql, h) => { fetchReq = { query: str(qp, ql), handler: h }; fetches.push(fetchReq); },
@@ -58,6 +63,33 @@ async function fresh() {
   const fire = (id, value = "") => { const [p, l] = write(value); X.dispatch(id, p, l); };
   const texts = () => nodes.filter(Boolean).map((n) => n.text).filter(Boolean);
   const has = (s) => texts().some((t) => t.includes(s));
+  // 从挂载根遍历「活树」收集文本(脱离的旧节点不算 → 负向断言可靠,如"X 已被替换/撤下")。
+  const liveTexts = () => {
+    const out = [];
+    const walk = (id) => { const x = nodes[id]; if (!x) return; if (x.text) out.push(x.text); (x.children || []).forEach(walk); };
+    walk(root);
+    return out;
+  };
+  const liveHas = (s) => liveTexts().some((t) => t.includes(s));
+  // 任一节点是否有某属性(可选指定值)—— 验证关键字属性名(type/for)未被 r# 污染。
+  const hasAttr = (k, v) => nodes.some((n) => n && n.attrs && (v === undefined ? n.attrs[k] !== undefined : n.attrs[k] === v));
+  // 任一节点的 .checked 状态(受控复选框/单选,set_checked 写入)
+  const anyChecked = () => nodes.some((n) => n && n.checked === true);
+  // 任一活树节点带某 class:既查 add_class/remove_class 的动态 .cls 集,也查静态 class 属性(set_attr)。
+  const anyClass = (cls) => {
+    let r = false;
+    const walk = (id) => {
+      const x = nodes[id];
+      if (!x) return;
+      if (x.cls && x.cls.has(cls)) r = true;
+      if (x.attrs && x.attrs.class && x.attrs.class.split(/\s+/).includes(cls)) r = true;
+      (x.children || []).forEach(walk);
+    };
+    walk(root);
+    return r;
+  };
+  // 触发所有挂起的 set_timeout 回调(过渡出场动画结束 → 真正移除)
+  const runTimeouts = () => { const ts = timeouts.splice(0); for (const t of ts) X.run_oneshot(t.h); };
   // 从挂载根遍历「活树」数 <li>(脱离的旧节点不算 → 反映 keyed For / 过滤的当前结果)
   const liCount = () => {
     let n = 0;
@@ -68,7 +100,7 @@ async function fresh() {
   const runInterval = (h) => X.run_interval(h); // 手动触发一次定时器回调
   // eval 结果回传:首字节 \x00=ok / \x01=err(与 router.js eval_js 一致)
   const evalReturn = (codeSub, result, okFlag = true) => { const e = evals.find((x) => x.code.includes(codeSub)); const [p, l] = write((okFlag ? "\x00" : "\x01") + result); X.on_fetch(e.handler, p, l); };
-  return { X, render, navigate, onFetch, fire, fetchFor, countFor, feed, texts, has, liCount, runInterval, evalReturn, focused, intervals, cleared, jsRun, evals, get fetchReq() { return fetchReq; }, get clearAppCalls() { return clearAppCalls; } };
+  return { X, render, navigate, onFetch, fire, fetchFor, countFor, feed, texts, has, liveHas, hasAttr, anyChecked, anyClass, runTimeouts, liCount, runInterval, evalReturn, focused, intervals, timeouts, cleared, jsRun, evals, get fetchReq() { return fetchReq; }, get clearAppCalls() { return clearAppCalls; } };
 }
 
 let ok = true;
@@ -94,7 +126,9 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   f.onFetch(TODOS);
   check(f.has("写代码") && f.has("喝咖啡"), "/         订阅数据 → 组件列表渲染");
   check(f.liCount() === 2, `/         2 个 <li>(keyed For),实际 ${f.liCount()}`);
-  check(f.has("共 2 项 · 1 未完成 · 1 已完成"), "/         memo 统计正确");
+  check(f.has("共 2") && f.has("未完成 1") && f.has("已完成 1"), "/         memo 统计(stat 徽章)正确");
+  check(f.anyClass("todo-enter"), "/         列表行带进场动画类 .todo-enter");
+  check(f.anyChecked(), "/         已完成行复选框 set_checked(bind:checked 反映 done)");
 }
 
 // 3) 首页:增 / 改 / 批量(事件 + 动态 mutation + mutation! 乐观)
@@ -102,13 +136,14 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   const f = await fresh();
   f.render("/");
   f.onFetch(TODOS);
-  // handler:0=form submit,1=input,2/3/4=过滤 tab,5=全部完成,6=清除,7=首行 toggle
-  f.fire(7); // 勾选第一行
-  check(f.fetchReq.query.includes("toggle_todo") && f.fetchReq.query.includes('"a"'), "/         勾选 → 动态 toggle_todo(id=a)");
-  f.fire(1, "买牛奶"); // 输入(bind:value)
-  f.fire(0); // 提交表单(on:submit)
+  // handler 注册序(shell 无 on:):0=提示条×,1=表单submit,2=输入,3/4/5=过滤(全部/未完成/已完成),
+  //   6=全部完成,7=清除,8=改名✎,然后每行 3 个:行a 9=复选框bind/10=toggle/11=删,行b 12/13/14。
+  f.fire(10); // 勾选第一行(toggle 真请求;复选框 bind 是 9,只动视觉)
+  check(f.fetchReq.query.includes("toggle_todo") && f.fetchReq.query.includes('"a"'), "/         勾选(复选框 on:change)→ 动态 toggle_todo(id=a)");
+  f.fire(2, "买牛奶"); // 输入(bind:value)
+  f.fire(1); // 提交表单(on:submit)
   check(f.fetchReq.query.includes("add_todo") && f.fetchReq.query.includes("买牛奶"), "/         表单提交 → add_todo(text=买牛奶)");
-  f.fire(5); // 全部完成(mutation! + 乐观)
+  f.fire(6); // 全部完成(mutation! + 乐观)
   check(f.fetchReq.query.includes("complete_all"), "/         全部完成 → mutation! complete_all");
 }
 
@@ -118,11 +153,11 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   f.render("/");
   f.onFetch(TODOS); // a 未完成, b 已完成
   check(f.liCount() === 2, "/         过滤前 2 行");
-  f.fire(3); // 未完成 tab
+  f.fire(4); // 未完成 tab(id 4)
   check(f.liCount() === 1, `/         过滤「未完成」→ 1 行,实际 ${f.liCount()}`);
-  f.fire(4); // 已完成 tab
+  f.fire(5); // 已完成 tab(id 5)
   check(f.liCount() === 1, `/         过滤「已完成」→ 1 行,实际 ${f.liCount()}`);
-  f.fire(2); // 全部
+  f.fire(3); // 全部(id 3)
   check(f.liCount() === 2, "/         过滤「全部」→ 2 行");
 }
 
@@ -241,7 +276,7 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   const f = await fresh();
   f.render("/");
   f.onFetch(TODOS);
-  f.fire(6); // 「清除已完成」按钮 → clear_done mutation
+  f.fire(7); // 「清除已完成」按钮 → clear_done mutation(handler 7,被提示条×=0 右移)
   f.feed('clear_done', '{"errors":[{"message":"nope"}]}');
   check(f.has("操作失败:nope"), "/         mutation! 失败 → on_error 回调写错误横幅(nope)");
 }
@@ -290,6 +325,116 @@ for (const [path, title] of [["/", "待办清单"], ["/archive", "归档"], ["/a
   check(g.has("🌐 en"), "/todo/1  eval Err → 走错误分支(回退 en),不把错误当值");
   f.fire(0); // 「复制链接」按钮(detail 唯一 on:click)
   check(f.jsRun.some((c) => c.includes("clipboard")), "/todo/1  复制按钮 → run_js(navigator.clipboard)");
+}
+
+// 17) Context:页面 provide(Greeting),深层 <GreetingBadge>(在 Panel 里)inject —— 无 props 传递
+{
+  const f = await fresh();
+  f.render("/");
+  f.onFetch(TODOS);
+  check(f.has("👤 当前用户(来自 context):rui"), "/         深层组件经 context 取到页面 provide 的 Greeting");
+}
+
+// 18) ErrorBoundary:子树上报错误(error_reporter,跨组件经 context 冒泡)→ fallback;reset → 恢复
+{
+  const f = await fresh();
+  f.render("/boundary");
+  check(f.liveHas("正常子树内容"), "/boundary 初始渲正常子树(<RiskyPanel>)");
+  // RiskyPanel 的「触发错误」按钮是本页首个 on:click(shell/navbar 无 on:)→ handler id 0
+  f.fire(0);
+  check(f.liveHas("RiskyPanel 主动上报的错误"), "/boundary 上报 → 渲 fallback(经 ErrorSink context 冒泡)");
+  check(!f.liveHas("正常子树内容"), "/boundary fallback 时正常子树已被替换(活树)");
+  // fallback 渲染后注册了「重试」on:click → handler id 1;reset 清错 → children 重建
+  f.fire(1);
+  check(f.liveHas("正常子树内容"), "/boundary reset → children 重建,恢复正常子树");
+  check(!f.liveHas("子树出错"), "/boundary reset 后 fallback 已撤下(活树)");
+}
+
+// 19) 换页清理事件处理器:HANDLERS 不随导航无界增长 → 换页后 handler id 从 0 重启
+{
+  const f = await fresh();
+  f.render("/");           // 首页注册若干 handler(id 0=表单提交…)
+  f.onFetch(TODOS);
+  f.navigate("/boundary"); // 换页(不同 key)→ clear_app + clear_handlers
+  f.fire(0);               // 已清理则 id 0 = /boundary 首个 on:click(RiskyPanel「触发错误」)
+  check(f.liveHas("RiskyPanel 主动上报的错误"), "/boundary 换页后 fire(0) 命中新页按钮 → HANDLERS 已回收(否则 id 0 仍指旧页)");
+}
+
+// 20) 表单完整度:bind:value(文本/数字)、bind:checked、bind:group、<select>、memo 校验、关键字属性
+{
+  const f = await fresh();
+  f.render("/forms");
+  check(f.hasAttr("type", "checkbox"), "/forms 关键字属性 type 正确(parse_any 未污染成 r#type → 浏览器认 checkbox)");
+  check(f.hasAttr("type", "radio") && f.hasAttr("type", "number"), "/forms type=radio/number 都正确渲出");
+  check(f.liveHas("姓名必填"), "/forms 初始 name 空 → memo 校验错误显示");
+  check(f.liveHas("姓名= · 年龄=18 · 订阅=false · 套餐=free · 主题=blue"), "/forms 初始受控值回显(数字/bool/单选/select)");
+  // handler id(shell 无 on:):0=name input,1=age input,2=checkbox,3=radio free,4=radio pro,5=select
+  f.fire(0, "Alice");
+  check(f.liveHas("姓名=Alice"), "/forms bind:value 文本 → 回显更新");
+  check(!f.liveHas("姓名必填"), "/forms 填了 name → 校验错误消失");
+  f.fire(1, "25");
+  check(f.liveHas("年龄=25"), "/forms bind:value 数字 → parse 回 i64");
+  f.fire(1, "abc"); // 非法 → parse 失败不写
+  check(f.liveHas("年龄=25"), "/forms 非法数字输入被忽略(parse 失败不写 signal)");
+  f.fire(2, "true");
+  check(f.liveHas("订阅=true"), "/forms bind:checked → Signal<bool>");
+  check(f.anyChecked(), "/forms set_checked 回写 .checked(受控复选框)");
+  f.fire(4, "pro");
+  check(f.liveHas("套餐=pro"), "/forms bind:group 单选 → Signal<String>");
+  f.fire(5, "green");
+  check(f.liveHas("主题=green"), "/forms <select> bind:value(change)→ Signal<String>");
+}
+
+// 21) 过渡:<Transition> 进出场 —— enter/leave 类 + 出场延时移除(代际防抖)
+{
+  const f = await fresh();
+  f.render("/transitions");
+  check(f.liveHas("我会淡入"), "/transitions 初始 show → child 在 DOM");
+  check(f.anyClass("fade-enter"), "/transitions 初始进场 → 加 fade-enter 类");
+  // 切换按钮是本页首个 on:click → id 0
+  f.fire(0); // show → false:出场
+  check(f.anyClass("fade-leave"), "/transitions 切换关 → 加 fade-leave(出场动画)");
+  check(f.liveHas("我会淡入"), "/transitions 出场动画期间 child 仍在 DOM(延时移除,非立即)");
+  f.runTimeouts(); // 出场动画结束 → 真正移除
+  check(!f.liveHas("我会淡入"), "/transitions 延时后 child 真正从 DOM 移除");
+  f.fire(0); // show → true:再进场
+  check(f.liveHas("我会淡入") && f.anyClass("fade-enter"), "/transitions 再切换开 → child 重新进场(fade-enter)");
+}
+
+// 22) 首页新特性:提示条 <Transition> 关闭 · AddForm 校验 · GreetingBadge context 内联改名
+{
+  // 22a 提示条:Transition 默认显示(SSR 安全),× 关闭 → 离场动画 + 延时移除
+  const f = await fresh();
+  f.render("/");
+  check(f.liveHas("本页用上了"), "/         提示条默认显示(<Transition> when=true)");
+  f.fire(0); // 点 ×(handler 0)
+  check(f.anyClass("fade-leave"), "/         关提示 → fade-leave 离场动画");
+  check(f.liveHas("本页用上了"), "/         离场动画期间提示条仍在(延时移除)");
+  f.runTimeouts();
+  check(!f.liveHas("本页用上了"), "/         延时后提示条真正移除");
+}
+{
+  // 22b AddForm 校验:实时字数 + 空提交被拦
+  const f = await fresh();
+  f.render("/");
+  check(f.has("0/80"), "/         AddForm 字数计数初始 0/80");
+  f.fire(1); // 空提交(submit handler 1)
+  check(!(f.fetchReq && f.fetchReq.query.includes("add_todo")), "/         空白提交被 memo 校验拦下(未发 add_todo)");
+  f.fire(2, "买牛奶"); // 输入(bind:value handler 2)
+  check(f.has("3/80"), "/         输入后字数 3/80");
+  f.fire(1); // 有效提交
+  check(f.fetchReq.query.includes("add_todo"), "/         有效提交 → add_todo");
+}
+{
+  // 22c GreetingBadge:深层组件经 context 内联改名(写回 context signal,无 prop-drill)
+  const f = await fresh();
+  f.render("/");
+  check(f.liveHas("当前用户(来自 context):rui"), "/         改名前显示 context 初值 rui");
+  f.fire(8); // 点 ✎ 进入编辑(handler 8)
+  check(f.liveHas("改名"), "/         点 ✎ → 进入编辑态(bind:value 输入框)");
+  f.fire(9, "小明"); // 编辑输入(bind:value handler 9)
+  f.fire(10); // 失焦保存(on:blur handler 10)→ 写回 context signal
+  check(f.liveHas("当前用户(来自 context):小明"), "/         on:blur 写回 context → 各处显示更新为 小明");
 }
 
 console.log(ok ? "✅ 全部通过" : "❌ 有失败");

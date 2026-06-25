@@ -160,33 +160,38 @@ pub fn set_current_query(query: &str) {
 // 在事件里重建)的 on_mount 也会及时跑,而不是漏掉或留到下次导航。
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    static MOUNT_QUEUE: RefCell<Vec<Box<dyn FnOnce()>>> = const { RefCell::new(Vec::new()) };
+    // (context 快照, 回调):快照在注册期(祖先 context 还在栈上)捕获,flush 时回放,
+    // 使 on_mount 里的 use_context / reactive_block 也能看见祖先 context(与 reactive_block/keyed_for 一致)。
+    static MOUNT_QUEUE: RefCell<Vec<(crate::reactive::ContextSnapshot, Box<dyn FnOnce()>)>> = const { RefCell::new(Vec::new()) };
     static NAV_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; // 导航代际:flush 中途换页则丢弃旧批
 }
 /// 注册一个挂载回调:本次渲染的节点进入 DOM 后执行(聚焦 / 启动定时器 / 初始化第三方库)。
 /// 仅客户端;服务端无 DOM,直接丢弃(SSR 不跑命令式副作用)。
 #[cfg(target_arch = "wasm32")]
 pub fn on_mount(f: impl FnOnce() + 'static) {
-    MOUNT_QUEUE.with(|q| q.borrow_mut().push(Box::new(f)));
+    let ctx = crate::reactive::capture_contexts(); // 注册期祖先 context 仍在栈 → 快照
+    MOUNT_QUEUE.with(|q| q.borrow_mut().push((ctx, Box::new(f))));
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub fn on_mount(_f: impl FnOnce() + 'static) {}
-/// 跑队列里的挂载回调。每个回调在子 scope 内执行、产物并入 PAGE_SCOPE(其内创建的 effect/memo
-/// 归当前页 → 切页时一并销毁,不泄漏);代际变化(回调里同步导航)则中止剩余旧批。client! 在
-/// dispatch / on_fetch / run_interval 尾部也调它,故 wasm 各入口的动态重建都能挂载。
+/// 跑队列里的挂载回调。每个回调在其 context 快照 + 子 scope 内执行、产物并入 PAGE_SCOPE(其内创建的
+/// effect/memo 归当前页 → 切页时一并销毁,不泄漏);代际变化(回调里同步导航)则中止剩余旧批。
+/// client! 在 dispatch / on_fetch / run_interval 尾部也调它,故 wasm 各入口的动态重建都能挂载。
 #[cfg(target_arch = "wasm32")]
 pub fn flush_mounts() {
     let gen = NAV_GEN.with(|g| g.get());
     loop {
-        let fns: Vec<Box<dyn FnOnce()>> = MOUNT_QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()));
+        let fns: Vec<(crate::reactive::ContextSnapshot, Box<dyn FnOnce()>)> =
+            MOUNT_QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()));
         if fns.is_empty() {
             break;
         }
-        for f in fns {
+        for (ctx, f) in fns {
             if NAV_GEN.with(|g| g.get()) != gen {
                 return; // 回调里换页了 → 剩余回调属于已 dispose 的旧页,丢弃
             }
-            let (_, mut child) = scope(move || f());
+            // 回放祖先 context,再在其上压子 scope 执行回调(use_context / reactive_block 可见祖先)。
+            let (_, mut child) = crate::reactive::with_contexts(&ctx, || scope(move || f()));
             let (ids, cleanups) = child.take_parts();
             PAGE_SCOPE.with(|s| {
                 if let Some(p) = s.borrow_mut().as_mut() {
@@ -258,6 +263,7 @@ pub fn navigate(route: fn(&str) -> crate::view::Page, full: &str) {
     set_path(path);
     set_query(query);
     dom::clear_app();
+    dom::clear_handlers(); // 旧 DOM 已抹掉 → 回收其事件处理器(否则换页时 HANDLERS 无界增长)
     CUR_KEY.with(|k| *k.borrow_mut() = Some(p.key.clone()));
     let render = p.render;
     bump_nav_gen();
@@ -308,7 +314,8 @@ pub unsafe fn navigate_route(ptr: *mut u8, len: usize, route: fn(&str) -> crate:
 /// `ptr`/`len` 必须来自 `alloc`。
 pub unsafe fn dispatch(id: u32, ptr: *mut u8, len: usize) {
     let value = String::from_utf8_lossy(&Vec::from_raw_parts(ptr, len, len)).into_owned();
-    dom::run_handler(id, &value);
+    // 自动 batch:一个事件处理器里的多次 set 合并成一次 flush(下游 memo/effect/视图只重算一次)。
+    crate::reactive::batch(|| dom::run_handler(id, &value));
     flush_mounts(); // 事件里 <Show> 打开 / <For> 新增行等动态子树的 on_mount,这里跑
 }
 
@@ -327,7 +334,11 @@ pub unsafe fn hydrate_data(ptr: *mut u8, len: usize) {
 /// `ptr`/`len` 必须来自 `alloc`。
 pub unsafe fn on_fetch(id: u32, ptr: *mut u8, len: usize) {
     let text = String::from_utf8_lossy(&Vec::from_raw_parts(ptr, len, len)).into_owned();
-    dom::run_fetch(id, &text);
+    // 自动 batch(与 dispatch 一致):一个 fetch 响应里的多次 store 写入(乐观回滚 restore +
+    // normalize_list,或多实体 merge_all 的逐 entity bump)合并成一次 flush。否则:
+    //   · 乐观 mutation 回滚→真值会闪一帧旧值(restore 先 flush 到回滚态,再 flush 到服务端态);
+    //   · 多实体查询会按 entity 数重复 flush(每个 bump 一次)。
+    crate::reactive::batch(|| dom::run_fetch(id, &text));
     flush_mounts(); // resource!/query! 结果到达后构建的行(keyed <For>)的 on_mount,这里跑
 }
 
@@ -379,6 +390,11 @@ macro_rules! client {
         pub extern "C" fn run_interval(hid: u32) {
             $crate::dom::run_interval(hid);
             $crate::runtime::flush_mounts(); // 定时器里动态重建的 on_mount
+        }
+        #[cfg(target_arch = "wasm32")]
+        #[no_mangle]
+        pub extern "C" fn run_oneshot(id: u32) {
+            $crate::dom::run_oneshot(id); // 过渡:出场动画结束后移除节点
         }
     };
 }

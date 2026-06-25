@@ -185,6 +185,11 @@ fn init(name: Option<&str>) {
         ("src/data/mod.rs", TPL_DATA_MOD.to_string()),
         ("src/api/mod.rs", TPL_API_MOD.to_string()),
         ("src/view/mod.rs", TPL_VIEW_MOD.to_string()),
+        // 组件目录形式:脚手架一个空的 components/ hub(约定即目录,按需往里加文件)。
+        ("src/view/components/mod.rs", TPL_COMPONENTS_MOD.to_string()),
+        // 页面目录 + 起始页(#[rui::page] + 计数器),让 `rui dev` 出来即能跑。
+        ("src/view/pages/mod.rs", TPL_PAGES_MOD.to_string()),
+        ("src/view/pages/home.rs", TPL_PAGE_HOME.to_string()),
     ];
     for (rel, content) in files {
         let p = root.join(rel);
@@ -220,3 +225,6 @@ const TPL_SSR: &str = include_str!("../templates/ssr.rs.tpl");
 const TPL_DATA_MOD: &str = include_str!("../templates/data_mod.rs.tpl");
 const TPL_API_MOD: &str = include_str!("../templates/api_mod.rs.tpl");
 const TPL_VIEW_MOD: &str = include_str!("../templates/view_mod.rs.tpl");
+const TPL_COMPONENTS_MOD: &str = include_str!("../templates/components_mod.rs.tpl");
+const TPL_PAGES_MOD: &str = include_str!("../templates/pages_mod.rs.tpl");
+const TPL_PAGE_HOME: &str = include_str!("../templates/page_home.rs.tpl");

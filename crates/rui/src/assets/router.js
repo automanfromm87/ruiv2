@@ -17,12 +17,15 @@ const env = {
   remove_child: (par, ch) => { const p = nodes[par], c = nodes[ch]; if (c && c.parentNode === p) p.removeChild(c); },
   set_attr: (id, np, nl, vp, vl) => nodes[id].setAttribute(str(np, nl), str(vp, vl)),
   set_value: (id, p, l) => { nodes[id].value = str(p, l); }, // 受控输入:写 .value property
-  // 事件:把 target.value(无则空串)随 dispatch 传回 wasm;表单 submit 默认 preventDefault。
+  set_checked: (id, on) => { nodes[id].checked = !!on; }, // 受控复选框 / 单选:写 .checked property
+  // 事件:把 payload 随 dispatch 传回 wasm。复选框传 target.checked("true"/"false"),其余传 target.value
+  // (单选 change 的 target.value=被选项的 value;<select> 的 target.value=选中 option)。submit 默认 preventDefault。
   add_event: (id, ep, el, h) => {
     const ev = str(ep, el);
     nodes[id].addEventListener(ev, (e) => {
       if (ev === "submit") e.preventDefault();
-      const v = e.target && e.target.value != null ? String(e.target.value) : "";
+      const t = e.target;
+      const v = t && t.type === "checkbox" ? String(!!t.checked) : (t && t.value != null ? String(t.value) : "");
       const b = encoder.encode(v);
       const ptr = wasm.alloc(b.length);
       new Uint8Array(mem.buffer, ptr, b.length).set(b);
@@ -56,6 +59,9 @@ const env = {
   // 定时器:每 ms 回调进 wasm 的 run_interval(handler);返回 timer id 供 clear_interval(on_cleanup)。
   set_interval: (ms, handler) => setInterval(() => wasm.run_interval(handler), ms),
   clear_interval: (timer) => clearInterval(timer),
+  set_timeout: (ms, handler) => setTimeout(() => wasm.run_oneshot(handler), ms), // 一次性延时(过渡出场后移除)
+  add_class: (id, p, l) => { const n = nodes[id]; if (n && n.classList) n.classList.add(str(p, l)); },
+  remove_class: (id, p, l) => { const n = nodes[id]; if (n && n.classList) n.classList.remove(str(p, l)); },
   // JS 逃生舱:直接执行任意 JS / 浏览器 API(无 wasm-bindgen 时的通用出口)。
   run_js: (p, l) => { try { (0, eval)(str(p, l)); } catch (e) { console.error("run_js:", e); } }, // 间接 eval = 全局作用域
   run_js_on: (id, p, l) => { const el = nodes[id]; try { eval(str(p, l)); } catch (e) { console.error("run_js_on:", e); } }, // 直接 eval:code 里可用 el

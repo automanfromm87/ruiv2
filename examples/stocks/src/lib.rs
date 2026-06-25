@@ -25,12 +25,16 @@ rui::router! {
     pages::archive,
     pages::detail, // /todo/:id —— 路由参数,模式 + 类型化签名都在 detail.rs
     // 路由组:/dash 与 /dash/settings 共享 dash_shell 侧栏(组内导航不重建侧栏,只换内层 outlet)。
-    group("/dash", layout = layout::dash_shell) {
-        pages::overview, // /dash
-        pages::settings, // /dash/settings
+    // 组专属布局 dash_shell 与组的页面同住在 view/pages/dash/(不在全局 layout.rs)。
+    group("/dash", layout = pages::dash::dash_shell) {
+        pages::dash::overview, // /dash
+        pages::dash::settings, // /dash/settings
     },
     pages::about,
     pages::draft,
+    pages::boundary, // /boundary —— <ErrorBoundary> 演示
+    pages::forms,    // /forms —— 表单(bind:value/checked/group + select + 校验)
+    pages::transitions, // /transitions —— <Transition> 进出场动画
     fallback = not_found,
 }
 

@@ -17,9 +17,17 @@ pub mod runtime;
 pub mod view;
 
 pub use view::{node_ref, NodeRef, Page, Strategy, View};
+// ErrorBoundary:子树出错 → 局部 fallback + reset 重试(`<ErrorBoundary fallback=..>`,建在 Context 上)。
+// throw_error 渲染期上报;error_reporter() 渲染期取上报器闭包,事件 / 异步回调里调。
+pub use view::{error_reporter, throw_error, ErrorSink};
 // 生命周期:on_mount(节点入 DOM 后,客户端)/ on_cleanup(scope 销毁时)。
 pub use reactive::on_cleanup;
 pub use runtime::on_mount;
+// Context:provide_context / use_context(跨层传 theme / store / 当前用户,免 prop-drill);
+// provider 子树局部 provide(不泄漏给兄弟)。
+pub use reactive::{provide_context, provider, use_context};
+// batch:合并多次 set 为一次 flush(事件入口已自动 batch)。
+pub use reactive::batch;
 // 路由:`param(i)`/`param_as::<T>(i)` 读 path 第 i 段(reactive,通常由 `#[rui::page]` 据模式串自动接);
 // `query_param("k")`/`query_param_as::<T>("k")` 读 `?k=`(在 body 里按需读,独立于 path);
 // `path()`/`query_string()` 原始 signal;`go` 程序化导航(pushState);`matches` 给 `router!` 分发。
@@ -46,8 +54,8 @@ pub use gql::exec::empty_resolver;
 /// 常用项一站式导入:`use rui::prelude::*;`
 pub mod prelude {
     pub use crate::gql::{FromValue, IntoValue, ToGqlArg, Value};
-    pub use crate::reactive::{effect, memo, scope, Signal};
-    pub use crate::view::{IntoView, View};
+    pub use crate::reactive::{batch, effect, memo, provide_context, provider, scope, use_context, Signal};
+    pub use crate::view::{error_reporter, throw_error, IntoView, View};
     pub use rui_macros::{
         component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource, router,
         subscription, view, GqlObject,

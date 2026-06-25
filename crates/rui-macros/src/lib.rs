@@ -10,9 +10,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TS2};
 use quote::quote;
+use syn::ext::IdentExt; // Ident::parse_any:把 `type` / `for` 等关键字也当属性名解析
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{Data, DeriveInput, Expr, Fields, Ident, LitStr, Stmt, Token, Type};
+use syn::{Data, DeriveInput, Expr, Fields, Ident, LitInt, LitStr, Stmt, Token, Type};
 
 enum Node {
     El { tag: String, attrs: Vec<Attr>, children: Vec<Node> },
@@ -21,6 +22,10 @@ enum Node {
     Show { when: syn::Block, fallback: Option<syn::Block>, children: Vec<Node> },
     // 多分支:命中第一个 when 为真的 <Match>,都不命中则什么也不渲染。
     Switch { arms: Vec<(syn::Block, Vec<Node>)> },
+    // 错误边界:子树出错 → 渲 fallback(闭包 |err: String, reset: Rc<dyn Fn()>| -> View)+ reset 重试。
+    ErrorBoundary { fallback: syn::Block, children: Vec<Node> },
+    // 过渡:单子元素进出场动画(when 为返回 bool 的闭包;name=CSS 类前缀;duration=出场后移除延时 ms)。
+    Transition { name: String, duration: u32, when: syn::Block, children: Vec<Node> },
     Text(LitStr),
     Block(syn::Block),
 }
@@ -53,6 +58,12 @@ fn parse_node(input: ParseStream) -> syn::Result<Node> {
     if tag == "Match" {
         return Err(syn::Error::new(tag.span(), "<Match> 只能放在 <Switch> 内"));
     }
+    if tag == "ErrorBoundary" {
+        return parse_error_boundary(input);
+    }
+    if tag == "Transition" {
+        return parse_transition(input);
+    }
     let mut attrs = Vec::new();
     loop {
         if input.peek(Token![/]) {
@@ -71,7 +82,7 @@ fn parse_node(input: ParseStream) -> syn::Result<Node> {
             attrs.push(Attr::Ref { handle: input.parse()? });
             continue;
         }
-        let name: Ident = input.parse()?;
+        let name = Ident::parse_any(input)?; // parse_any:允许 `type` / `for` 等关键字做属性名
         if input.peek(Token![:]) {
             // 前缀语法:on:<事件>={...} 事件处理;bind:<属性>={signal} 双向绑定。
             input.parse::<Token![:]>()?;
@@ -190,6 +201,65 @@ fn parse_switch(input: ParseStream) -> syn::Result<Node> {
         arms.push((when, children));
     }
     Ok(Node::Switch { arms })
+}
+
+// <ErrorBoundary fallback={ |err, reset| view!{..} }> children </ErrorBoundary>
+fn parse_error_boundary(input: ParseStream) -> syn::Result<Node> {
+    let mut fallback: Option<syn::Block> = None;
+    loop {
+        if input.peek(Token![>]) {
+            input.parse::<Token![>]>()?;
+            break;
+        }
+        let name: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let blk: syn::Block = input.parse()?;
+        match name.to_string().as_str() {
+            "fallback" => fallback = Some(blk),
+            _ => return Err(syn::Error::new(name.span(), "<ErrorBoundary> 只支持 fallback=")),
+        }
+    }
+    let children = parse_children(input)?;
+    let fallback = fallback.ok_or_else(|| {
+        syn::Error::new(Span::call_site(), "<ErrorBoundary> 需要 fallback={ |err, reset| view!{..} }")
+    })?;
+    Ok(Node::ErrorBoundary { fallback, children })
+}
+
+// <Transition name="fade" duration=300 when={ 闭包 }> child </Transition>
+// name:CSS 类前缀(必填);duration:出场动画后移除的延时 ms(可选,默认 300);when:返回 bool 的闭包(必填)。
+fn parse_transition(input: ParseStream) -> syn::Result<Node> {
+    let mut name: Option<String> = None;
+    let mut duration: u32 = 300;
+    let mut when: Option<syn::Block> = None;
+    loop {
+        if input.peek(Token![>]) {
+            input.parse::<Token![>]>()?;
+            break;
+        }
+        let attr: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        match attr.to_string().as_str() {
+            "name" => name = Some(input.parse::<LitStr>()?.value()),
+            "duration" => {
+                if !input.peek(LitInt) {
+                    return Err(syn::Error::new(attr.span(), "<Transition> duration 须是编译期整数字面量(如 duration=300)"));
+                }
+                duration = input.parse::<LitInt>()?.base10_parse()?;
+            }
+            "when" => when = Some(input.parse::<syn::Block>()?),
+            _ => return Err(syn::Error::new(attr.span(), "<Transition> 只支持 name= / duration= / when=")),
+        }
+    }
+    let children = parse_children(input)?;
+    let name = name.ok_or_else(|| syn::Error::new(Span::call_site(), "<Transition> 需要 name=\"...\"(CSS 类前缀)"))?;
+    let when = when.ok_or_else(|| syn::Error::new(Span::call_site(), "<Transition> 需要 when={ move || cond.get() }"))?;
+    // 单一子元素约束:多子 / <For> 会被 emit_branch 包进 rui-frag(display:contents),CSS 动画作用其上不可见。
+    // 故强制单子元素(需要包多个时用户自己套一个 <div>)。
+    if children.len() != 1 || matches!(children[0], Node::For { .. }) {
+        return Err(syn::Error::new(Span::call_site(), "<Transition> 需要单一根子元素(多个或 <For> 请自行套一个 <div>);否则动画作用在 display:contents 包裹上不可见"));
+    }
+    Ok(Node::Transition { name, duration, when, children })
 }
 
 fn parse_children(input: ParseStream) -> syn::Result<Vec<Node>> {
@@ -373,6 +443,31 @@ fn gen_node(n: &Node) -> TS2 {
                 })
             }
         }
+        Node::ErrorBoundary { fallback, children } => {
+            // fallback 是闭包 |err: String, reset: Rc<dyn Fn()>| -> View;children 每次(含重试)按需重建。
+            // 复用 is_reactive(末句为闭包)做检测,与 <Show>/<Switch> 的 when/fallback 一致。
+            if !is_reactive(fallback) {
+                return quote! { compile_error!("<ErrorBoundary> 的 fallback 需要闭包,例: fallback={ |err: String, reset: std::rc::Rc<dyn Fn()>| view!{ .. } }") };
+            }
+            let fb = unwrap_block(fallback);
+            let branch = emit_branch(children);
+            quote! {
+                rui::view::error_boundary(
+                    #fb,
+                    move || -> rui::View { rui::View(#branch) },
+                )
+            }
+        }
+        Node::Transition { name, duration, when, children } => {
+            if !is_reactive(when) {
+                return quote! { compile_error!("<Transition> 的 when 需要闭包,例: when={ move || cond.get() }") };
+            }
+            let pred = unwrap_block(when);
+            let branch = emit_branch(children); // child 只构建一次(transition 内部按需显隐)
+            quote! {
+                rui::view::transition(#name, #duration, #pred, move || -> rui::View { rui::View(#branch) })
+            }
+        }
         Node::El { tag, attrs, children } => {
             let is_component = tag.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
             if is_component {
@@ -431,15 +526,44 @@ fn gen_node(n: &Node) -> TS2 {
                     quote! {{ let __rf = #h; __rf.set(__n); }}
                 }
                 Attr::Bind { prop, expr } => {
-                    if prop != "value" {
-                        quote! { compile_error!("目前只支持 bind:value(受控文本输入,signal 须为 Signal<String>)"); }
-                    } else {
-                        let s = unwrap_block(expr);
-                        // 双向:signal→.value(effect 反应式回写)+ input 事件→signal。
-                        quote! {{
-                            { let __s = (#s).clone(); rui::reactive::effect(move || rui::dom::set_value(__n, &::std::format!("{}", __s.get()))); }
-                            { let __s = (#s).clone(); rui::dom::on(__n, "input", move |__v: &str| __s.set(__v.to_string())); }
-                        }}
+                    let s = unwrap_block(expr);
+                    match prop.as_str() {
+                        // 受控文本 / 数字 / <select>:signal→.value(effect 回写)+ 事件→parse 回 signal。
+                        // signal 类型 T 只需 Display + FromStr:String(parse 无损)/ i64 / f64 都行;parse 失败
+                        // (非法 / 空)则不写 → 数字框输入垃圾被忽略。<select> 用 change,文本用 input(实时)。
+                        "value" => {
+                            let event = if tag.as_str() == "select" { "change" } else { "input" };
+                            quote! {{
+                                { let __s = (#s).clone(); rui::reactive::effect(move || rui::dom::set_value(__n, &::std::format!("{}", __s.get()))); }
+                                { let __s = (#s).clone(); rui::dom::on(__n, #event, move |__v: &str| { if let ::std::result::Result::Ok(__x) = __v.parse() { __s.set(__x); } }); }
+                            }}
+                        }
+                        // 受控复选框(Signal<bool>):signal→.checked(effect)+ change 事件(payload "true"/"false")。
+                        "checked" => quote! {{
+                            { let __s = (#s).clone(); rui::reactive::effect(move || rui::dom::set_checked(__n, __s.get())); }
+                            { let __s = (#s).clone(); rui::dom::on(__n, "change", move |__v: &str| __s.set(__v == "true")); }
+                        }},
+                        // 单选组(Signal<String>):checked = (signal == 本项 value);change → signal.set(本项 value)。
+                        // 需配套 value="..."(从本元素自身的 value 属性取本 radio 的取值)。
+                        "group" => {
+                            let val = attrs.iter().find_map(|a| match a {
+                                Attr::Static { name, value } if name == "value" => Some(quote! { #value.to_string() }),
+                                Attr::Dyn { name, block } if name == "value" => {
+                                    let v = unwrap_block(block);
+                                    Some(quote! { (#v).to_string() })
+                                }
+                                _ => None,
+                            });
+                            match val {
+                                // __val 在 effect **内**求值:静态 value 是常量;动态 value={signal} 则订阅它 → 值变也响应。
+                                Some(val) => quote! {{
+                                    { let __s = (#s).clone(); rui::reactive::effect(move || { let __val = #val; rui::dom::set_checked(__n, __s.get() == __val); }); }
+                                    { let __s = (#s).clone(); rui::dom::on(__n, "change", move |__v: &str| __s.set(__v.to_string())); }
+                                }},
+                                None => quote! { compile_error!("bind:group 的 <input type=\"radio\"> 需配套 value=\"...\"(本项取值)"); },
+                            }
+                        }
+                        _ => quote! { compile_error!("bind: 支持 value(文本/数字/select)、checked(复选框)、group(单选组)"); },
                     }
                 }
             }).collect();

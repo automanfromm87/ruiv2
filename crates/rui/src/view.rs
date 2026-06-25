@@ -172,11 +172,13 @@ where
 {
     let cell: Rc<RefCell<Option<(V::State, Scope)>>> = Rc::new(RefCell::new(None));
     let node: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    let ctx = crate::reactive::capture_contexts(); // 祖先 context 快照:后续重建里 use_context 仍能看见
     {
         let cell = cell.clone();
         let node = node.clone();
         effect(move || {
-            let (v, sc) = scope(|| f()); // 子作用域:持有本轮构建产生的内层 effect
+            // 子作用域:持有本轮构建产生的内层 effect。with_contexts 让重建时也看得到祖先 context。
+            let (v, sc) = crate::reactive::with_contexts(&ctx, || scope(|| f()));
             let mut slot = cell.borrow_mut();
             match slot.as_mut() {
                 Some((state, scope_slot)) => {
@@ -193,6 +195,155 @@ where
         });
     }
     node.get()
+}
+
+// ── ErrorBoundary(错误边界:子树出错 → 局部 fallback + 重试,建在 Context 之上)──
+
+/// 错误边界经 Context 下发给子树的句柄:子树里 `throw_error` / `error_reporter()` 把错误写进它,
+/// 边界本身订阅它 → `Some` 渲 fallback、`None` 渲 children。按类型(TypeId)注入,故每子树取最近一个。
+#[derive(Clone)]
+pub struct ErrorSink(pub Signal<Option<String>>);
+
+/// 在最近 `<ErrorBoundary>` 子树内**当下**上报一个错误(应在渲染期调:此时 context 栈含边界的 sink)。
+/// 触发该边界渲 fallback。不在任何边界内 → 返回 `false`(忽略)。事件 / effect 里上报请用 `error_reporter`。
+pub fn throw_error(msg: impl Into<String>) -> bool {
+    if let Some(sink) = crate::reactive::use_context::<ErrorSink>() {
+        sink.0.set(Some(msg.into()));
+        true
+    } else {
+        // 无祖先边界时静默丢弃一个**真实错误**很难排查 → debug 构建打印一行(release 零开销)。
+        #[cfg(debug_assertions)]
+        eprintln!("rui: throw_error 调用处没有祖先 <ErrorBoundary>,错误被忽略:{}", msg.into());
+        false
+    }
+}
+
+/// 渲染期取一个「上报器」:返回的闭包捕获了最近边界的 sink,之后在事件 / effect / 异步回调里调它
+/// 即可把错误送达边界(无需届时还在 context 栈上)。不在任何边界内 → 返回 no-op 闭包。
+pub fn error_reporter() -> Rc<dyn Fn(String)> {
+    match crate::reactive::use_context::<ErrorSink>() {
+        Some(sink) => Rc::new(move |m| sink.0.set(Some(m))),
+        None => Rc::new(|_| {}),
+    }
+}
+
+/// `<ErrorBoundary fallback={ |err, reset| .. }>children</ErrorBoundary>` 的运行时。
+/// 建一个 error signal,经 Context provide 给 children 子树(供 `throw_error`/`error_reporter` 上报);
+/// 用 `reactive_block` 据它分派:
+///   · `None`     → 在 sink 可见的上下文里构建 children(native 额外 `catch_unwind` 兜住 SSR 渲染 panic);
+///   · `Some(e)`  → 渲 `fallback(e, reset)`,`reset()` 清错 → reactive_block 重建 children(即"重试")。
+/// 嵌套边界:children 里的内层 `<ErrorBoundary>` 会就近 provide 自己的 sink → 内层先接住(冒泡到最近)。
+pub fn error_boundary<FB, CH>(fallback: FB, children: CH) -> u32
+where
+    FB: Fn(String, Rc<dyn Fn()>) -> View + 'static,
+    CH: Fn() -> View + 'static,
+{
+    let err: Signal<Option<String>> = Signal::new(None);
+    let sink = ErrorSink(err.clone());
+    let reset: Rc<dyn Fn()> = {
+        let err = err.clone();
+        // 空写守卫:已是 None 不再 set(否则 None→None 仍会调度一次无谓重建,呼应 memo / set_path 的去抖)。
+        Rc::new(move || {
+            if err.get().is_some() {
+                err.set(None);
+            }
+        })
+    };
+    reactive_block(move || -> View {
+        match err.get() {
+            Some(e) => fallback(e, reset.clone()),
+            None => {
+                // 把 sink provide 进本轮 children 子树(写 reactive_block 的 scope 帧,随重建弹出,不泄漏给兄弟)。
+                crate::reactive::provide_context(sink.clone());
+                match build_children(&children) {
+                    // native 渲染 panic → 直接渲 fallback(不写 err signal:避免在本 effect 运行中 set 自身
+                    // 依赖触发的重入重跑 → fallback 被调两次。重渲时仍会重走 children → 再次 catch,行为自洽)。
+                    Err(msg) => fallback(msg, reset.clone()),
+                    Ok(v) => {
+                        // 渲染期 throw_error / error_reporter 在本次 build 中写了 err → 改渲 fallback,
+                        // 否则会错误地显示 children(那次 set 触发的重入重跑会被本分支的结果覆盖)。untrack 不再订阅。
+                        match crate::reactive::untrack(|| err.get()) {
+                            Some(e) => fallback(e, reset.clone()),
+                            None => v,
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+// children 构建:native 用 catch_unwind 把渲染期 panic 转成 Err(msg)(SSR 不因一处 panic 整请求崩);
+// wasm(panic=abort,无法 catch_unwind)直接构建 —— 该端的渲染错误走 throw_error/error_reporter 显式通道。
+#[cfg(not(target_arch = "wasm32"))]
+fn build_children<CH: Fn() -> View>(children: &CH) -> Result<View, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| children())).map_err(panic_message)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn build_children<CH: Fn() -> View>(children: &CH) -> Result<View, String> {
+    Ok(children())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "渲染时发生未知错误".to_string()
+    }
+}
+
+// ── Transition(单子元素进出场动画:enter/leave CSS 类 + 延时移除)──
+
+/// `<Transition name="fade" when={ move || cond.get() }>child</Transition>` 的运行时。
+/// child **只构建一次**(其内部反应式照常更新);用 CSS 类(配 `@keyframes`,故进场无需双帧 reflow 仪式):
+///   · `when` false→true:append child → 去 `{name}-leave` + 加 `{name}-enter`(播放进场动画);
+///   · `when` true→false:去 `{name}-enter` + 加 `{name}-leave`(播放出场动画)→ `dur` ms 后**真正移除**。
+/// 快速来回切:代际计数令旧的"延时移除"作废(出场途中又被切回则不移除)。
+/// 注:动画是客户端行为(SSR 下 set_timeout 为 no-op、不会延时移除)。
+/// **建议仅用于 csr 页**(`#[rui::page(csr, ..)]`):child 在渲染期无条件 build,SSR 若 `when()`=false
+/// 则 child 被建却不进 HTML(仍消耗 hid)→ 客户端水合时该 child 自身 hid 对不上 SSR DOM 而错位
+/// (页面其余节点因 hid 计数两端一致、不受影响)。csr 页无水合,完全规避。
+/// 换页若发生在出场延时回调之前:回调仍跑,但 remove_child 对已不在树上的节点是安全 no-op(router.js 有 parentNode 校验)。
+pub fn transition<W, B>(name: &str, dur: u32, when: W, build: B) -> u32
+where
+    W: Fn() -> bool + 'static,
+    B: FnOnce() -> View + 'static,
+{
+    let anchor = dom::el("rui-slot");
+    // 直接构建 child(其 effect 归当前页 scope;context 此刻在栈上可见)—— 只建一次,之后只切显隐。
+    let child_node = build().0;
+    let enter = format!("{name}-enter");
+    let leave = format!("{name}-leave");
+    let shown = Rc::new(Cell::new(false));
+    let gen = Rc::new(Cell::new(0u32));
+    effect(move || {
+        let on = when();
+        if on == shown.get() {
+            return; // 状态没变(when 的其它依赖变化)→ 不重复动画
+        }
+        shown.set(on);
+        gen.set(gen.get().wrapping_add(1)); // 每次切换都使上一次的"延时移除"作废
+        if on {
+            dom::remove_class(child_node, &leave);
+            dom::append(anchor, child_node); // 进场:appendChild 移动/挂载(出场途中切回也安全)
+            dom::add_class(child_node, &enter);
+        } else {
+            dom::remove_class(child_node, &enter);
+            dom::add_class(child_node, &leave);
+            // 抓拍本次出场的代际 gn:出场途中若被切回(再切换会 bump gen),回调里 g.get() != gn → 不移除。
+            let (g, gn) = (gen.clone(), gen.get());
+            dom::set_timeout(dur, move || {
+                if g.get() == gn {
+                    dom::remove_child(anchor, child_node); // 期间未被切回 → 出场动画结束,真正移除
+                }
+            });
+        }
+    });
+    anchor
 }
 
 // keyed <For> 的一行:key、根节点 id、item 快照(用于检测内容是否变)、子作用域(行内 effect 的归属)。
@@ -221,6 +372,7 @@ where
 {
     let state: Rc<RefCell<Vec<KeyedRow<T, K>>>> = Rc::new(RefCell::new(Vec::new()));
     let st = state.clone();
+    let ctx = crate::reactive::capture_contexts(); // 祖先 context 快照(新行/重建行的 use_context 也能见)
     effect(move || {
         let items = list.get();
         let new_keys: Vec<K> = items.iter().map(|i| key_of(i)).collect();
@@ -247,12 +399,12 @@ where
                     next.push(row);
                 } else {
                     dom::remove_child(parent, row.node); // item 变 → 重建本行
-                    let (n, sc) = scope(|| build(item));
+                    let (n, sc) = crate::reactive::with_contexts(&ctx, || scope(|| build(item)));
                     dom::append(parent, n);
                     next.push(KeyedRow { key, node: n, item: item.clone(), scope: sc });
                 }
             } else {
-                let (n, sc) = scope(|| build(item)); // 新 key
+                let (n, sc) = crate::reactive::with_contexts(&ctx, || scope(|| build(item))); // 新 key
                 dom::append(parent, n);
                 next.push(KeyedRow { key, node: n, item: item.clone(), scope: sc });
             }
@@ -264,4 +416,111 @@ where
         }
         *st.borrow_mut() = next;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reactive::scope;
+
+    #[test]
+    fn error_reporter_noop_outside_boundary() {
+        // 不在任何边界内:throw_error 返回 false,error_reporter() 返回 no-op(调用不 panic)。
+        let (_r, sc) = scope(|| {
+            assert!(!throw_error("无人接住"));
+            let rep = error_reporter();
+            rep("也不会 panic".to_string());
+        });
+        sc.dispose();
+    }
+
+    #[test]
+    fn error_boundary_throw_then_reset() {
+        // 子树取上报器 → 上报 → 渲 fallback;reset → 重建子树恢复(端到端,native dom 后端)。
+        dom::reset();
+        let reporter: Rc<RefCell<Option<Rc<dyn Fn(String)>>>> = Rc::new(RefCell::new(None));
+        let resetter: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let rep_cell = reporter.clone();
+        let res_cell = resetter.clone();
+        let (node, _sc) = scope(|| {
+            error_boundary(
+                move |e, reset| {
+                    *res_cell.borrow_mut() = Some(reset); // 存 reset 句柄供测试调用
+                    View(dom::text(&format!("ERR:{}", e)))
+                },
+                move || {
+                    *rep_cell.borrow_mut() = Some(error_reporter()); // 子树渲染期取上报器
+                    View(dom::text("OK"))
+                },
+            )
+        });
+        dom::mount(node);
+        assert!(dom::take_html().contains("OK"), "初始应渲正常子树");
+
+        // 模拟事件回调里上报错误。
+        (reporter.borrow().clone().unwrap())("boom".to_string());
+        let html = dom::take_html();
+        assert!(html.contains("ERR:boom"), "上报后应渲 fallback: {html}");
+
+        // reset → children 重建 → 恢复正常子树。
+        (resetter.borrow().clone().unwrap())();
+        assert!(dom::take_html().contains("OK"), "reset 后应恢复");
+    }
+
+    #[test]
+    fn set_checked_toggles_checked_attr() {
+        // 受控复选框的 SSR 渲染:set_checked(true) 加 `checked` 属性,false 移除(首屏勾选状态可见)。
+        dom::reset();
+        let n = dom::el("input");
+        dom::mount(n);
+        dom::set_checked(n, true);
+        assert!(dom::take_html().contains("checked"), "true → 应有 checked 属性");
+        dom::set_checked(n, false);
+        assert!(!dom::take_html().contains("checked"), "false → 应移除 checked 属性");
+    }
+
+    #[test]
+    fn transition_toggles_enter_leave_classes() {
+        // 进出场:show→child 带 fade-enter;切关→换 fade-leave(native set_timeout no-op,故 SSR 不延时移除)。
+        dom::reset();
+        let show = Signal::new(true);
+        let s2 = show.clone();
+        let (node, _sc) = scope(|| {
+            transition("fade", 300, move || s2.get(), || {
+                let d = dom::el("div");
+                dom::append(d, dom::text("hi"));
+                View(d)
+            })
+        });
+        dom::mount(node);
+        let h = dom::take_html();
+        assert!(h.contains("hi") && h.contains("fade-enter"), "初始 show:child + fade-enter:{h}");
+        show.set(false);
+        let h = dom::take_html();
+        assert!(h.contains("fade-leave"), "切关:加 fade-leave:{h}");
+        assert!(!h.contains("fade-enter"), "切关:去掉 fade-enter:{h}");
+    }
+
+    #[test]
+    fn native_panic_renders_fallback_exactly_once() {
+        // 子树渲染 panic(native catch_unwind 兜)→ fallback 只渲一次(回归:旧实现 err.set 触发重入 → 双调)。
+        dom::reset();
+        let fb_calls = Rc::new(Cell::new(0));
+        let fc = fb_calls.clone();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // 静音预期内的 panic 输出
+        let (node, _sc) = scope(|| {
+            error_boundary(
+                move |e, _reset| {
+                    fc.set(fc.get() + 1);
+                    View(dom::text(&format!("ERR:{e}")))
+                },
+                || panic!("boom"),
+            )
+        });
+        std::panic::set_hook(prev_hook);
+        dom::mount(node);
+        assert_eq!(fb_calls.get(), 1, "fallback 应只渲一次");
+        assert!(dom::take_html().contains("ERR:boom"), "应渲出 panic 消息");
+    }
 }

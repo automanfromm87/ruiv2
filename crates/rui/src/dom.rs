@@ -24,6 +24,7 @@ mod backend {
             pub fn set_attr(node: u32, np: *const u8, nl: usize, vp: *const u8, vl: usize);
             pub fn add_event(node: u32, ep: *const u8, elen: usize, handler: u32);
             pub fn set_value(node: u32, ptr: *const u8, len: usize); // 受控输入:设 .value 属性
+            pub fn set_checked(node: u32, on: u32); // 受控复选框 / 单选:设 .checked property
             pub fn clear_children(node: u32);
             pub fn gql_query(q_ptr: *const u8, q_len: usize, handler: u32);
             pub fn gql_subscribe(q_ptr: *const u8, q_len: usize, handler: u32);
@@ -34,6 +35,9 @@ mod backend {
             pub fn scroll_into_view(node: u32); // 命令式:滚动到元素
             pub fn set_interval(ms: u32, handler: u32) -> u32; // 定时器:返回 timer id
             pub fn clear_interval(timer: u32); // 清定时器(on_cleanup 用)
+            pub fn set_timeout(ms: u32, handler: u32); // 一次性延时回调(过渡:出场动画结束后移除)
+            pub fn add_class(node: u32, ptr: *const u8, len: usize); // classList.add(过渡 enter/leave 类)
+            pub fn remove_class(node: u32, ptr: *const u8, len: usize); // classList.remove
             pub fn run_js(ptr: *const u8, len: usize); // JS 逃生舱:即发即弃 eval(全局作用域)
             pub fn run_js_on(node: u32, ptr: *const u8, len: usize); // 同上,但 code 里 `el` = 该节点
             pub fn eval_js(ptr: *const u8, len: usize, handler: u32); // eval 取返回(支持 Promise)→ 回调
@@ -110,6 +114,12 @@ mod backend {
     pub fn clear_app() {
         unsafe { ffi::clear_app() }
     }
+    // 换页时清空事件处理器表(必须在 clear_app 之后调:旧 DOM 已抹掉,其 handler id 不会再触发;
+    // 新页从 id 0 重新注册)。这样事件处理器不再随每次换页无界增长(对称于 INTERVAL/FETCH_HANDLERS 的回收)。
+    // 注意:只在**换页**(clear_app 处)调,绝不在同页 / 组内导航调 —— 那时 DOM 仍在,handler 必须留着。
+    pub fn clear_handlers() {
+        HANDLERS.with(|h| h.borrow_mut().clear());
+    }
     // 程序化导航:把新 URL 推进浏览器历史(地址栏更新、可分享、可后退)。
     pub fn push_url(url: &str) {
         unsafe { ffi::push_url(url.as_ptr(), url.len()) }
@@ -155,6 +165,42 @@ mod backend {
         if let Some(f) = f {
             f();
         }
+    }
+    // 一次性延时回调(过渡的出场动画结束后移除节点)。slot 存 FnOnce,run_oneshot 取走并调一次。
+    thread_local! {
+        static ONESHOTS: RefCell<Vec<Option<Box<dyn FnOnce()>>>> = const { RefCell::new(Vec::new()) };
+    }
+    pub fn set_timeout(ms: u32, f: impl FnOnce() + 'static) {
+        let id = ONESHOTS.with(|h| {
+            let mut v = h.borrow_mut();
+            let b = Some(Box::new(f) as Box<dyn FnOnce()>);
+            // 复用已触发(None)的槽位 → 避免 Vec 随每次过渡无界增长。已触发的槽无在途定时器引用其 id,
+            // 故复用不会 id 碰撞;未触发的槽保持占用、其 id 不被复用(等它触发后自然变 None 回收)。
+            match v.iter().position(|s| s.is_none()) {
+                Some(i) => {
+                    v[i] = b;
+                    i as u32
+                }
+                None => {
+                    v.push(b);
+                    (v.len() - 1) as u32
+                }
+            }
+        });
+        unsafe { ffi::set_timeout(ms, id) }
+    }
+    pub fn run_oneshot(id: u32) {
+        let f = ONESHOTS.with(|h| h.borrow_mut().get_mut(id as usize).and_then(|s| s.take()));
+        if let Some(f) = f {
+            f();
+        }
+    }
+    // 过渡:增删单个 class(不动其它 class —— attr 设整串会覆盖)。
+    pub fn add_class(node: u32, cls: &str) {
+        unsafe { ffi::add_class(node, cls.as_ptr(), cls.len()) }
+    }
+    pub fn remove_class(node: u32, cls: &str) {
+        unsafe { ffi::remove_class(node, cls.as_ptr(), cls.len()) }
     }
     // ── JS 逃生舱:直接调任意 JS / 浏览器 API(无 wasm-bindgen 时的通用出口)──
     /// 即发即弃执行 JS(全局作用域):写剪贴板 / localStorage.setItem / scrollTo / 调第三方库等。
@@ -202,6 +248,10 @@ mod backend {
     // 受控输入:设置元素的 .value(property,不是 attribute)。
     pub fn set_value(node: u32, s: &str) {
         unsafe { ffi::set_value(node, s.as_ptr(), s.len()) }
+    }
+    // 受控复选框 / 单选:设置 .checked(property)。
+    pub fn set_checked(node: u32, on: bool) {
+        unsafe { ffi::set_checked(node, on as u32) }
     }
     pub fn run_handler(id: u32, value: &str) {
         let f = HANDLERS.with(|h| h.borrow().get(id as usize).cloned());
@@ -376,6 +426,17 @@ mod backend {
             }
         });
     }
+    // SSR:受控复选框渲染成 checked 属性(on=true 加 `checked=""`,false 则移除),首屏勾选状态可见。
+    pub fn set_checked(node: u32, on: bool) {
+        ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            let attrs = &mut a[node as usize].attrs;
+            attrs.retain(|(k, _)| k != "checked");
+            if on {
+                attrs.push(("checked".to_string(), String::new()));
+            }
+        });
+    }
     pub fn clear(node: u32) {
         ARENA.with(|a| {
             let mut a = a.borrow_mut();
@@ -437,6 +498,7 @@ mod backend {
         DOC_ROOT.with(|d| d.set(Some(node))); // 文档根(take_html 时序列化)
     }
     pub fn clear_app() {} // 服务端无 SPA 导航(对称占位)
+    pub fn clear_handlers() {} // 服务端不绑事件(对称占位)
     pub fn push_url(_url: &str) {} // 服务端无浏览器历史(对称占位)
     // 命令式 DOM / 定时器:服务端无 DOM / 无事件循环,全部 no-op(on_mount 本就不在服务端跑)。
     pub fn focus(_node: u32) {}
@@ -446,6 +508,33 @@ mod backend {
     }
     pub fn clear_interval(_timer: u32) {}
     pub fn run_interval(_hid: u32) {}
+    pub fn set_timeout(_ms: u32, _f: impl FnOnce() + 'static) {} // 服务端无定时器(过渡的延时移除不发生)
+    pub fn run_oneshot(_id: u32) {}
+    // 过渡 class:SSR 时把 enter/leave 类并入 class 属性(首屏初态可见;无动画)。
+    pub fn add_class(node: u32, cls: &str) {
+        ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            let attrs = &mut a[node as usize].attrs;
+            if let Some(slot) = attrs.iter_mut().find(|(k, _)| k == "class") {
+                if !slot.1.split_whitespace().any(|c| c == cls) {
+                    if !slot.1.is_empty() {
+                        slot.1.push(' ');
+                    }
+                    slot.1.push_str(cls);
+                }
+            } else {
+                attrs.push(("class".to_string(), cls.to_string()));
+            }
+        });
+    }
+    pub fn remove_class(node: u32, cls: &str) {
+        ARENA.with(|a| {
+            let mut a = a.borrow_mut();
+            if let Some(slot) = a[node as usize].attrs.iter_mut().find(|(k, _)| k == "class") {
+                slot.1 = slot.1.split_whitespace().filter(|c| *c != cls).collect::<Vec<_>>().join(" ");
+            }
+        });
+    }
     // JS 逃生舱:服务端无 JS 运行时 → 全部 no-op(eval 的回调不触发,与 on_mount 同样只在客户端跑)。
     pub fn run_js(_code: &str) {}
     pub fn run_js_on(_node: u32, _code: &str) {}
