@@ -57,6 +57,9 @@ pub struct App {
 //    进程级 OnceLock(一服务一配置,启动设一次、只读;同 RESOLVE 模式)。所有字段 Default = 当前字面量,
 //    故零配置 serve(app) / serve_axum(app) 行为字节不变;serve_with / serve_axum_with 传自定义。两后端共享同一份配置。
 
+/// 默认 wasm 路由(单一真相源:AssetMap::default 与 default_shell 的"是否注入 window.__rui_wasm"判定共用)。
+const DEFAULT_WASM_ROUTE: &str = "/app.wasm";
+
 /// 静态资源的路由 + 磁盘路径映射(路由名与磁盘文件名都可改)。
 #[derive(Clone)]
 pub struct AssetMap {
@@ -70,7 +73,7 @@ impl Default for AssetMap {
     fn default() -> Self {
         AssetMap {
             router_js_route: "/router.js".into(),
-            wasm_route: "/app.wasm".into(),
+            wasm_route: DEFAULT_WASM_ROUTE.into(),
             wasm_disk: "web/app.wasm".into(),
             css_route: "/styles.css".into(),
             css_disk: "web/styles.css".into(),
@@ -113,16 +116,36 @@ pub(crate) fn config() -> &'static AppConfig {
     CONFIG.get_or_init(AppConfig::default)
 }
 pub(crate) fn set_config(cfg: AppConfig) {
+    // 校验资源路由互不冲突、也不撞协议端点。否则两后端行为分歧:axum 启动 panic(Router 重复路由),
+    // std 静默首匹配(if/else 链先中先用)。这里统一在设配置时 loud 失败,两后端一致、尽早暴露。
+    let routes = [
+        "/graphql",
+        "/graphql/subscribe",
+        cfg.assets.router_js_route.as_str(),
+        cfg.assets.wasm_route.as_str(),
+        cfg.assets.css_route.as_str(),
+    ];
+    for i in 0..routes.len() {
+        for j in (i + 1)..routes.len() {
+            assert!(
+                routes[i] != routes[j],
+                "rui: AppConfig 资源路由冲突 `{}` —— /graphql · /graphql/subscribe · router_js · wasm · css 须各异",
+                routes[i]
+            );
+        }
+    }
     let _ = CONFIG.set(cfg); // 启动设一次(serve_with / serve_axum_with);重复设忽略
 }
 
 /// 默认整页骨架(= 原 doc())。css_href / router_src 来自 AssetMap;wasm_route 非默认时注入 window.__rui_wasm
 /// (默认时不注入 → 与历史输出字节一致,router.js 缺省 fallback `/app.wasm`)。
 pub fn default_shell(c: &ShellCtx) -> String {
-    let wasm_inject = if c.wasm_route == "/app.wasm" {
+    let wasm_inject = if c.wasm_route == DEFAULT_WASM_ROUTE {
         String::new()
     } else {
-        format!("<script>window.__rui_wasm=\"{}\"</script>", c.wasm_route)
+        // 转义 `\` / `"` / `</`:防自定义 wasm_route 破坏 <script> 字符串或提前闭合标签。
+        let safe = c.wasm_route.replace('\\', "\\\\").replace('"', "\\\"").replace("</", "<\\/");
+        format!("<script>window.__rui_wasm=\"{}\"</script>", safe)
     };
     format!(
         "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
@@ -239,7 +262,7 @@ fn read_request(s: &mut TcpStream, body_limit: usize) -> Vec<u8> {
             let cl = content_length(&buf[..p]);
             let body_start = p + 4;
             // body 上限(对齐 axum 的 DefaultBodyLimit):只读到 limit,不为超大 Content-Length 无界分配(防内存 DoS)。
-            while buf.len() < body_start + cl && buf.len() <= body_start + body_limit {
+            while buf.len() < body_start + cl && buf.len() < body_start + body_limit {
                 match s.read(&mut tmp) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => buf.extend_from_slice(&tmp[..n]),
@@ -269,7 +292,9 @@ fn handle(mut s: TcpStream, app: App) {
     let cfg = config();
     let raw = read_request(&mut s, cfg.body_limit);
     let req = String::from_utf8_lossy(&raw);
-    let target = req.split_whitespace().nth(1).unwrap_or("/");
+    let mut parts = req.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
     // 拆成 pathname + query(fragment 浏览器不会发,稳妥起见也去掉):pathname 走路由匹配 / path 参数,
     // query 单独喂 query 参数(两条线)。修了 /todo/1?x=1 的 param 不再变 "1?x=1"、/about?utm=x 不掉 404。
     let no_frag = target.split('#').next().unwrap_or(target);
@@ -279,7 +304,8 @@ fn handle(mut s: TcpStream, app: App) {
     };
 
     // ── subscription:SSE 长连接(本线程独占,循环推送)──
-    if path.starts_with("/graphql/subscribe") {
+    // 精确匹配(== 而非 starts_with):与 axum 的 .route 精确路由一致,/graphql/subscribe/x 等落到统一 SSR/资源分发。
+    if path == "/graphql/subscribe" {
         if let Some(sse) = app.sse {
             let _ = s.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
@@ -300,8 +326,12 @@ fn handle(mut s: TcpStream, app: App) {
     // 资源路由 / 磁盘路径 / router.js 内容均来自 cfg(可配置宿主);/graphql 端点固定(协议入口)。
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (&str, &str, Vec<u8>) {
         if path == "/graphql" {
-            let q = req.split("\r\n\r\n").nth(1).unwrap_or("");
-            ("200 OK", "application/json; charset=utf-8", exec::execute(q, app.resolve).into_bytes())
+            // POST-only(对齐 axum):GET mutation 是 CSRF 向量,非 POST → 405。
+            if method != "POST" {
+                ("405 Method Not Allowed", "application/json; charset=utf-8", br#"{"data":null,"errors":[{"message":"method not allowed"}]}"#.to_vec())
+            } else {
+                graphql_response(&raw, cfg.body_limit, app.resolve) // body 从原始字节切 + from_utf8→400 + 超限→413(对齐 axum)
+            }
         } else if path == cfg.assets.router_js_route {
             ("200 OK", "text/javascript; charset=utf-8", cfg.router_js.as_bytes().to_vec())
         } else if path == cfg.assets.wasm_route {
@@ -333,6 +363,23 @@ fn file(p: &str, ctype: &'static str) -> (&'static str, &'static str, Vec<u8>) {
     match std::fs::read(p) {
         Ok(b) => ("200 OK", ctype, b),
         Err(_) => ("404 Not Found", "text/plain", format!("{p} missing").into_bytes()),
+    }
+}
+
+// /graphql 响应:body 从**原始字节**首个 \r\n\r\n 后切出(保留体内 CRLF,不被 req.split 截断)→
+// 声明超 body_limit → 413(对齐 axum;read_request 已只读到 limit 防 OOM)→ 非法 UTF-8 → 400(对齐 axum)→ 执行。
+fn graphql_response(raw: &[u8], body_limit: usize, resolve: Resolver) -> (&'static str, &'static str, Vec<u8>) {
+    const JSON: &str = "application/json; charset=utf-8";
+    let boundary = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(p) => p,
+        None => return ("400 Bad Request", JSON, br#"{"data":null,"errors":[{"message":"malformed request"}]}"#.to_vec()),
+    };
+    if content_length(&raw[..boundary]) > body_limit {
+        return ("413 Payload Too Large", JSON, br#"{"data":null,"errors":[{"message":"request body too large"}]}"#.to_vec());
+    }
+    match std::str::from_utf8(&raw[boundary + 4..]) {
+        Ok(q) => ("200 OK", JSON, exec::execute(q, resolve).into_bytes()),
+        Err(_) => ("400 Bad Request", JSON, br#"{"data":null,"errors":[{"message":"invalid UTF-8 in request body"}]}"#.to_vec()),
     }
 }
 
@@ -506,6 +553,30 @@ mod config_tests {
 <script type=\"module\" src=\"/router.js\"></script></body></html>";
         assert_eq!(html, expected, "默认 shell 与历史 doc() 字节不一致(零配置回归)");
         assert!(!html.contains("__rui_wasm"), "默认 wasm 路由不应注入全局(保字节一致)");
+    }
+
+    #[test]
+    fn graphql_response_body_handling() {
+        // std /graphql body 处理(对齐 axum):body 从原始字节切(保体内 CRLF)+ from_utf8→400 + 超限→413。
+        use super::graphql_response;
+        use crate::gql::exec::empty_resolver;
+        let req = |cl: usize, body: &[u8]| {
+            let mut v = format!("POST /graphql HTTP/1.1\r\nContent-Length: {cl}\r\n\r\n").into_bytes();
+            v.extend_from_slice(body);
+            v
+        };
+        // 正常:200
+        let (st, _, _) = graphql_response(&req(16, b"{ todos { id } }"), 1 << 20, empty_resolver);
+        assert_eq!(st, "200 OK");
+        // 非法 UTF-8 → 400(而非 lossy 静默喂解析器)
+        let (st, _, _) = graphql_response(&req(5, b"{ \xff }"), 1 << 20, empty_resolver);
+        assert_eq!(st, "400 Bad Request");
+        // 声明超 body_limit → 413(对齐 axum)
+        let (st, _, _) = graphql_response(&req(999999, b"{}"), 100, empty_resolver);
+        assert_eq!(st, "413 Payload Too Large");
+        // 体内含 \r\n\r\n 不被截断(从原始字节首个边界后整体取):查询含空行仍完整执行(返 200,非截断报错)
+        let (st, _, _) = graphql_response(&req(20, b"{ a }\r\n\r\n{ b }"), 1 << 20, empty_resolver);
+        assert_eq!(st, "200 OK");
     }
 
     #[test]

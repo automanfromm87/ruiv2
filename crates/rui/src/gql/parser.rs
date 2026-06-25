@@ -37,9 +37,14 @@ pub struct Document {
     pub ops: Vec<Operation>,
 }
 
+// selection 最大嵌套深度:超过即停止递归(改迭代跳过),防深嵌套 `{{{…` 把递归下降打爆栈 →
+// Rust 栈溢出是硬 abort(guard-page),catch_unwind 抓不住 → 整进程死。这是未授权远程 DoS 的根因防护。
+const MAX_DEPTH: usize = 64;
+
 struct P<'a> {
     b: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl<'a> P<'a> {
@@ -186,11 +191,41 @@ impl<'a> P<'a> {
         let args = if self.ch() == b'(' { self.args() } else { Vec::new() };
         self.ws();
         let selection = if self.ch() == b'{' {
-            self.selection_set()
+            // 深度守卫:超 MAX_DEPTH 不再递归,改迭代跳过这层平衡花括号(防深嵌套打爆栈 → 进程 abort)。
+            if self.depth >= MAX_DEPTH {
+                self.skip_braces();
+                Vec::new()
+            } else {
+                self.depth += 1;
+                let s = self.selection_set();
+                self.depth -= 1;
+                s
+            }
         } else {
             Vec::new()
         };
         Field { alias, name, args, selection }
+    }
+    fn skip_braces(&mut self) {
+        // 迭代跳过一个平衡的 `{ ... }`(超最大嵌套深度时替代递归,杜绝栈溢出)。
+        let mut d = 0;
+        loop {
+            let c = self.ch();
+            if c == 0 {
+                break;
+            }
+            if c == b'{' {
+                d += 1;
+            } else if c == b'}' {
+                d -= 1;
+                self.i += 1;
+                if d == 0 {
+                    break;
+                }
+                continue;
+            }
+            self.i += 1;
+        }
     }
     fn skip_var_defs(&mut self) {
         // 跳过 operation 的变量定义 `(...)`(平衡括号)
@@ -247,7 +282,7 @@ impl<'a> P<'a> {
 }
 
 pub fn parse(s: &str) -> Document {
-    let mut p = P { b: s.as_bytes(), i: 0 };
+    let mut p = P { b: s.as_bytes(), i: 0, depth: 0 };
     let mut ops = Vec::new();
     loop {
         p.ws();
@@ -300,5 +335,15 @@ mod tests {
         // 仍能正常解析合法查询
         let doc = parse("{ stocks { symbol } }");
         assert_eq!(doc.ops[0].selection[0].name, "stocks");
+    }
+
+    // 深嵌套不爆栈(MAX_DEPTH 守卫):1M 层 `{` 必须正常返回,而非递归下降栈溢出 → 进程 abort(远程 DoS)。
+    #[test]
+    fn deep_nesting_does_not_overflow_stack() {
+        let payload = "{".repeat(1_000_000);
+        let _ = parse(&payload); // 不爆栈即通过(超 MAX_DEPTH 后迭代跳过,不再递归)
+        // 守卫不影响合法的中等嵌套(< MAX_DEPTH):a{b{c{d}}} 仍正确解析
+        let doc = parse("{ a { b { c { d } } } }");
+        assert_eq!(doc.ops[0].selection[0].selection[0].selection[0].selection[0].name, "d");
     }
 }
