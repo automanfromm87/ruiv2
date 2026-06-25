@@ -5,3 +5,7 @@ pub mod schema;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod todos;
+
+// PG 数据后端(DATABASE_URL 存在时用,否则 resolver 回退 todos 内存)。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod db;

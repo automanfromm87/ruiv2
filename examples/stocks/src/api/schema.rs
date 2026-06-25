@@ -74,52 +74,94 @@ pub fn resolve(
 // 订阅走 App.sse 内存广播(不经 GraphQL 执行)→ EmptySubscription。
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ag {
+    use crate::api::db::Pg;
     use crate::data::model::{Todo, TodoConnection};
-    use async_graphql::{EmptySubscription, Object, Schema};
+    use async_graphql::{Context, EmptySubscription, Object, Schema};
+
+    // resolver 分发:Context 里注入了 Pg 后端(DATABASE_URL 存在)→ 走 PG;否则回退内存。
+    // 这是 per-request Context 的用法 —— 以后换成事务 / 当前用户也是同一套机制。
+    fn pg<'a>(ctx: &'a Context<'_>) -> Option<&'a Pg> {
+        ctx.data_opt::<Pg>()
+    }
 
     pub struct AgQuery;
     #[Object(rename_fields = "snake_case", rename_args = "snake_case")]
     impl AgQuery {
-        async fn todos(&self) -> Vec<Todo> {
-            crate::api::todos::all()
+        async fn todos(&self, ctx: &Context<'_>) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::all(p).await,
+                None => crate::api::todos::all(),
+            }
         }
-        async fn todo_page(&self, first: i64, after: String) -> Vec<TodoConnection> {
-            crate::api::todos::page(first, &after)
+        async fn todo_page(&self, ctx: &Context<'_>, first: i64, after: String) -> Vec<TodoConnection> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::page(p, first, &after).await,
+                None => crate::api::todos::page(first, &after),
+            }
         }
-        async fn search(&self, q: String) -> Vec<Todo> {
-            crate::api::todos::search(&q)
+        async fn search(&self, ctx: &Context<'_>, q: String) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::search(p, &q).await,
+                None => crate::api::todos::search(&q),
+            }
         }
-        async fn detail(&self, id: String) -> Vec<Todo> {
-            crate::api::todos::detail(&id)
+        async fn detail(&self, ctx: &Context<'_>, id: String) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::detail(p, &id).await,
+                None => crate::api::todos::detail(&id),
+            }
         }
         // 镜像 subscription 字段:订阅的 SSR 初值经 transport 改写成 query 后在此 resolve(当前值)。
-        async fn todo_updates(&self) -> Vec<Todo> {
-            crate::api::todos::all()
+        async fn todo_updates(&self, ctx: &Context<'_>) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::all(p).await,
+                None => crate::api::todos::all(),
+            }
         }
     }
 
     pub struct AgMutation;
     #[Object(rename_fields = "snake_case", rename_args = "snake_case")]
     impl AgMutation {
-        async fn add_todo(&self, text: String) -> Vec<Todo> {
-            crate::api::todos::add(&text)
+        async fn add_todo(&self, ctx: &Context<'_>, text: String) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::add(p, &text).await,
+                None => crate::api::todos::add(&text),
+            }
         }
-        async fn toggle_todo(&self, id: String) -> Vec<Todo> {
-            crate::api::todos::toggle(&id)
+        async fn toggle_todo(&self, ctx: &Context<'_>, id: String) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::toggle(p, &id).await,
+                None => crate::api::todos::toggle(&id),
+            }
         }
-        async fn remove_todo(&self, id: String) -> Vec<Todo> {
-            crate::api::todos::remove(&id)
+        async fn remove_todo(&self, ctx: &Context<'_>, id: String) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::remove(p, &id).await,
+                None => crate::api::todos::remove(&id),
+            }
         }
-        async fn clear_done(&self) -> Vec<Todo> {
-            crate::api::todos::clear_done()
+        async fn clear_done(&self, ctx: &Context<'_>) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::clear_done(p).await,
+                None => crate::api::todos::clear_done(),
+            }
         }
-        async fn complete_all(&self) -> Vec<Todo> {
-            crate::api::todos::complete_all()
+        async fn complete_all(&self, ctx: &Context<'_>) -> Vec<Todo> {
+            match pg(ctx) {
+                Some(p) => crate::api::db::complete_all(p).await,
+                None => crate::api::todos::complete_all(),
+            }
         }
     }
 
     pub type AppSchema = Schema<AgQuery, AgMutation, EmptySubscription>;
-    pub fn build_schema() -> AppSchema {
-        Schema::build(AgQuery, AgMutation, EmptySubscription).finish()
+    /// 构建 schema;pg 为 Some 则注入 Context(resolver 走 PG),否则 resolver 回退内存。
+    pub fn build_schema(pg: Option<Pg>) -> AppSchema {
+        let mut b = Schema::build(AgQuery, AgMutation, EmptySubscription);
+        if let Some(p) = pg {
+            b = b.data(p);
+        }
+        b.finish()
     }
 }

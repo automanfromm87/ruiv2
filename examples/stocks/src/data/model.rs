@@ -7,7 +7,7 @@
 use rui::GqlObject;
 
 #[derive(Clone, PartialEq, GqlObject)]
-#[cfg_attr(not(target_arch = "wasm32"), derive(async_graphql::SimpleObject))]
+#[cfg_attr(not(target_arch = "wasm32"), derive(async_graphql::SimpleObject, sqlx::FromRow))]
 #[cfg_attr(not(target_arch = "wasm32"), graphql(rename_fields = "snake_case"))]
 pub struct Todo {
     #[gql(id)]
