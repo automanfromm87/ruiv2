@@ -10,14 +10,11 @@ crate-type = ["cdylib", "rlib"]
 rui = { path = "../../crates/rui" }
 rui-macros = { path = "../../crates/rui-macros" }
 
-# axum 生产后端只对 native(SSR bin)启用 —— wasm 客户端不拉 axum/tokio/async-graphql(零依赖不变)。
+# axum 生产后端只对 native(SSR bin)启用 —— wasm 客户端不拉 axum/postgres(零依赖不变)。
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rui = { path = "../../crates/rui", features = ["axum"] }
-# 服务端 GraphQL schema 用 async-graphql 定义(与 rui 同版本 → cargo 统一为一份)。
-async-graphql = "7.2.1"
-# 异步 PG 驱动(resolver 现是 async → 直接 .await 查库)。DATABASE_URL 未设则 resolver 回退内存。
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros"] }
-tokio = { version = "1", default-features = false, features = ["sync"] } # OnceCell:连接池懒初始化(在 runtime 内首次连接)
+# 同步 PG 驱动(契合 rui 同步 exec 引擎:无 tokio / 无 async / 无 block_on 桥)。DATABASE_URL 未设或连接失败 → 回退内存后端。
+postgres = "0.19"
 
 [[bin]]
 name = "ssr"

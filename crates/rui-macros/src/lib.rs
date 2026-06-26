@@ -17,7 +17,7 @@ use quote::quote;
 use syn::ext::IdentExt; // Ident::parse_any:把 `type` / `for` 等关键字也当属性名解析
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{Data, DeriveInput, Expr, Fields, Ident, LitInt, LitStr, Stmt, Token, Type};
+use syn::{parse_quote, Data, DeriveInput, Expr, Fields, Ident, LitInt, LitStr, Stmt, Token, Type};
 
 // ───────────────────────── rui::app!(应用 registry:解耦宏与目录结构)─────────────────────────
 // 宏不再硬编码 crate::view::components / crate::data::model / crate::api::schema / crate::gqlf,而是统一引用
@@ -873,6 +873,11 @@ impl Parse for PageAttr {
 pub fn page(attr: TokenStream, item: TokenStream) -> TokenStream {
     let PageAttr { strategy: strat, pattern, name: route_name } = syn::parse_macro_input!(attr as PageAttr);
     let f = syn::parse_macro_input!(item as syn::ItemFn);
+    emit_page(strat, pattern, route_name, f)
+}
+
+// 共享的页面发射逻辑(`#[page]` 与 `#[route(ssr|csr|static)]` 复用,产出 `fn() -> rui::Page`)。
+fn emit_page(strat: TS2, pattern: String, route_name: Option<String>, f: syn::ItemFn) -> TokenStream {
     let vis = &f.vis;
     let name = &f.sig.ident;
     // 稳定 RouteId(取代 module_path!()):显式 name 优先;否则用路由模式串(顶层页即全路径,稳定、可读、跨重命名/跨 crate 不变);
@@ -975,6 +980,251 @@ pub fn page(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
+// ───────────────────────── #[rui::route(ssr|csr|static, "...")] ─────────────────────────
+// 统一的页面路由声明宏:ssr / csr / static 与 `#[page]` 完全等价(`#[route(ssr,..)]` 即 `#[page(ssr,..)]` 别名)。
+// 本框架是 **GraphQL-native**:JSON API 就是 GraphQL(/graphql + query!/mutation!/subscription!),
+// 不做 REST —— 故 `#[route]` 没有 `api` 种类(写了会给出友好报错,引导用 GraphQL)。
+struct RouteAttr {
+    strat: TS2,
+    pattern: String,
+    name: Option<String>,
+}
+impl Parse for RouteAttr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        // 第一个 token = 渲染策略。static 是关键字,单独 peek。
+        let strat = if input.peek(Token![static]) {
+            input.parse::<Token![static]>()?;
+            quote! { rui::Strategy::Static }
+        } else {
+            let id: Ident = input.parse()?;
+            match id.to_string().as_str() {
+                "ssr" => quote! { rui::Strategy::Ssr },
+                "csr" => quote! { rui::Strategy::Csr },
+                "api" => {
+                    return Err(syn::Error::new(
+                        id.span(),
+                        "#[rui::route] 不提供 REST `api`:本框架是 GraphQL-native,JSON API 用 GraphQL(/graphql + query!/mutation!)。#[route] 只支持 ssr / csr / static",
+                    ))
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        id.span(),
+                        format!("#[rui::route] 第一个参数须是 ssr / csr / static,收到 `{other}`"),
+                    ))
+                }
+            }
+        };
+        if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+        }
+        // 路由模式串 + 可选 name=(复用 page 语法)。
+        let mut pattern = String::new();
+        let mut name = None;
+        while !input.is_empty() {
+            if input.peek(LitStr) {
+                pattern = input.parse::<LitStr>()?.value();
+            } else {
+                let id: Ident = input.parse()?;
+                if id == "name" {
+                    input.parse::<Token![=]>()?;
+                    name = Some(input.parse::<LitStr>()?.value());
+                } else {
+                    return Err(syn::Error::new(
+                        id.span(),
+                        format!("#[rui::route] 只支持路由模式串 + 可选 name=\"..\",收到 `{id}`"),
+                    ));
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(RouteAttr { strat, pattern, name })
+    }
+}
+
+#[proc_macro_attribute]
+pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let RouteAttr { strat, pattern, name } = syn::parse_macro_input!(attr as RouteAttr);
+    let f = syn::parse_macro_input!(item as syn::ItemFn);
+    emit_page(strat, pattern, name, f)
+}
+
+// ───────────────────────── #[rui::job] ─────────────────────────
+// AsyncJob 声明:把 `fn name(ctx: &JobCtx, payload: P) -> JobResult { BODY }` 改写成
+//   #[cfg(not wasm)] struct name;  +  impl rui::Job for name { type Payload = P; const NAME = ".."; fn run(..) { BODY } }
+// marker 类型沿用用户函数名(`enqueue::<name>(P{..})` 与 `platform!{ jobs { ..::name } }` 直接引用)。
+#[proc_macro_attribute]
+pub fn job(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let f = syn::parse_macro_input!(item as syn::ItemFn);
+    emit_job(f)
+}
+fn emit_job(f: syn::ItemFn) -> TokenStream {
+    let vis = &f.vis;
+    let name = &f.sig.ident;
+    let name_str = name.to_string();
+    let inputs = &f.sig.inputs;
+    let output = &f.sig.output;
+    let body = &f.block;
+    if f.sig.asyncness.is_some() {
+        return syn::Error::new_spanned(
+            &f.sig,
+            "#[rui::job] 第一版为同步(引擎同步);async 支持随 async 引擎到来",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if !f.sig.generics.params.is_empty() || f.sig.generics.where_clause.is_some() {
+        return syn::Error::new_spanned(&f.sig.generics, "#[rui::job] 不支持泛型 / where 约束")
+            .to_compile_error()
+            .into();
+    }
+    if matches!(output, syn::ReturnType::Default) {
+        return syn::Error::new_spanned(&f.sig, "#[rui::job] 必须返回 rui::JobResult(`-> JobResult`)")
+            .to_compile_error()
+            .into();
+    }
+    if inputs.iter().any(|a| matches!(a, syn::FnArg::Receiver(_))) {
+        return syn::Error::new_spanned(inputs, "#[rui::job] 不支持 self 接收者:job handler 是自由函数")
+            .to_compile_error()
+            .into();
+    }
+    // 恰好两个参数:`ctx: &rui::JobCtx, payload: <类型>`。payload 类型 → Job::Payload。
+    let typed: Vec<&syn::PatType> =
+        inputs.iter().filter_map(|a| if let syn::FnArg::Typed(pt) = a { Some(pt) } else { None }).collect();
+    if typed.len() != 2 {
+        return syn::Error::new_spanned(
+            inputs,
+            "#[rui::job] handler 需恰好两个参数:`ctx: &rui::JobCtx, payload: <类型>`",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let payload_ty = &typed[1].ty;
+    quote! {
+        #[allow(non_camel_case_types)]
+        #[cfg(not(target_arch = "wasm32"))]
+        #vis struct #name;
+        #[cfg(not(target_arch = "wasm32"))]
+        impl rui::Job for #name {
+            type Payload = #payload_ty;
+            const NAME: &'static str = #name_str;
+            // 用户原签名(ctx + payload)+ 原体作 run;payload 参数类型 == Self::Payload,合法。
+            fn run(#inputs) #output #body
+        }
+    }
+    .into()
+}
+
+// ───────────────────────── #[rui::cron(every = "..")] ─────────────────────────
+// CronJob 声明:把 `fn name(ctx: &JobCtx, tick: CronTick) -> JobResult { BODY }` 改写成
+//   marker `struct name;` + `impl rui::Job`(payload=CronTick,故 worker 能跑)+ `impl rui::CronJob`(带触发间隔)。
+// 第一版 = 固定间隔(every = "30s"/"5m"/"1h"/"1d");完整 cron 表达式("0 0 2 * * *")是后续。
+struct CronAttr {
+    secs: u64,
+}
+impl Parse for CronAttr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let kw: Ident = input
+            .parse()
+            .map_err(|_| syn::Error::new(Span::call_site(), "#[rui::cron] 需要 `every = \"<时长>\"`(如 every = \"30s\")"))?;
+        if kw != "every" {
+            return Err(syn::Error::new(
+                kw.span(),
+                "#[rui::cron] 第一版只支持 `every = \"<时长>\"`(如 every = \"30s\" / \"5m\" / \"1h\" / \"1d\");完整 cron 表达式是后续",
+            ));
+        }
+        input.parse::<Token![=]>()?;
+        let lit: LitStr = input.parse()?;
+        let secs = parse_duration(&lit.value()).ok_or_else(|| {
+            syn::Error::new(lit.span(), "时长格式:正整数 + s/m/h/d(如 \"30s\" / \"5m\" / \"1h\" / \"1d\")")
+        })?;
+        Ok(CronAttr { secs })
+    }
+}
+// "30s"→30 / "5m"→300 / "2h"→7200 / "1d"→86400。无后缀或非正整数 → None。
+fn parse_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1u64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86400)
+    } else {
+        return None;
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(n * mult)
+}
+
+#[proc_macro_attribute]
+pub fn cron(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let CronAttr { secs } = syn::parse_macro_input!(attr as CronAttr);
+    let f = syn::parse_macro_input!(item as syn::ItemFn);
+    emit_cron(secs, f)
+}
+
+fn emit_cron(secs: u64, f: syn::ItemFn) -> TokenStream {
+    let vis = &f.vis;
+    let name = &f.sig.ident;
+    let name_str = name.to_string();
+    let inputs = &f.sig.inputs;
+    let output = &f.sig.output;
+    let body = &f.block;
+    if f.sig.asyncness.is_some() {
+        return syn::Error::new_spanned(&f.sig, "#[rui::cron] 第一版为同步(引擎同步);async 支持随 async 引擎到来")
+            .to_compile_error()
+            .into();
+    }
+    if !f.sig.generics.params.is_empty() || f.sig.generics.where_clause.is_some() {
+        return syn::Error::new_spanned(&f.sig.generics, "#[rui::cron] 不支持泛型 / where 约束")
+            .to_compile_error()
+            .into();
+    }
+    if matches!(output, syn::ReturnType::Default) {
+        return syn::Error::new_spanned(&f.sig, "#[rui::cron] 必须返回 rui::JobResult(`-> JobResult`)")
+            .to_compile_error()
+            .into();
+    }
+    if f.sig.inputs.iter().any(|a| matches!(a, syn::FnArg::Receiver(_))) {
+        return syn::Error::new_spanned(inputs, "#[rui::cron] 不支持 self 接收者:cron handler 是自由函数")
+            .to_compile_error()
+            .into();
+    }
+    let typed = inputs.iter().filter(|a| matches!(a, syn::FnArg::Typed(_))).count();
+    if typed != 2 {
+        return syn::Error::new_spanned(
+            inputs,
+            "#[rui::cron] handler 需恰好两个参数:`ctx: &rui::JobCtx, tick: rui::CronTick`",
+        )
+        .to_compile_error()
+        .into();
+    }
+    quote! {
+        #[allow(non_camel_case_types)]
+        #[cfg(not(target_arch = "wasm32"))]
+        #vis struct #name;
+        // cron job 也是 Job(payload 固定 CronTick)→ worker 的 run_job 能按 NAME 解码 + 执行。
+        #[cfg(not(target_arch = "wasm32"))]
+        impl rui::Job for #name {
+            type Payload = rui::CronTick;
+            const NAME: &'static str = #name_str;
+            fn run(#inputs) #output #body
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        impl rui::CronJob for #name {
+            const INTERVAL_SECS: u64 = #secs;
+        }
+    }
+    .into()
+}
+
 // ───────────────────────── router!(路由表 = 候选页 / 路由组列表)─────────────────────────
 // 用法:rui::router! {
 //   [layout = path::shell,]                         // 全局外壳(包裹每个命中项)
@@ -1064,20 +1314,12 @@ impl Parse for Router {
     }
 }
 
-#[proc_macro]
-pub fn router(input: TokenStream) -> TokenStream {
-    let r = syn::parse_macro_input!(input as Router);
-    let fallback = match &r.fallback {
-        Some(f) => quote! { #f },
-        None => {
-            return syn::Error::new(Span::call_site(), "router! 需要 `fallback = <返回 View 的 fn>`")
-                .to_compile_error()
-                .into()
-        }
-    };
+// 共享路由代码生成:把路由项(页面 + 组 + API)生成 `pub fn route(path)->Page` + `pub fn api(method,path)->Option<ApiRoute>`。
+// `router!` 与 `platform!` 都用它(`platform!` 再额外生成 `app() -> AppRuntime`)。
+fn emit_route_table(layout: &Option<syn::Path>, fallback_tok: &TS2, items: &[RouterItem]) -> TS2 {
     // 每个 item → (匹配条件, 命中后的 Page 表达式)。
     let mut entries: Vec<(TS2, TS2)> = Vec::new();
-    for item in &r.items {
+    for item in items {
         match item {
             RouterItem::Page(p) => {
                 entries.push((
@@ -1129,12 +1371,12 @@ pub fn router(input: TokenStream) -> TokenStream {
         }
     }
     // 从后往前折叠成 if/else if … else { fallback }。
-    let mut chain = quote! { rui::Page::new("not_found", rui::Strategy::Ssr, #fallback) };
+    let mut chain = quote! { rui::Page::new("not_found", rui::Strategy::Ssr, #fallback_tok) };
     for (cond, page) in entries.iter().rev() {
         chain = quote! { if #cond { #page } else { #chain } };
     }
     // 全局 layout 包裹(可选):保留命中项的 key/strategy,渲染交给 layout 包外壳。
-    let wrap = match &r.layout {
+    let wrap = match layout {
         Some(layout) => quote! {
             let (__key, __strategy, __render) = (__inner.key.clone(), __inner.strategy, __inner.render);
             let __p = __path.to_string();
@@ -1150,6 +1392,315 @@ pub fn router(input: TokenStream) -> TokenStream {
         pub fn route(__path: &str) -> rui::Page {
             let __inner: rui::Page = #chain;
             #wrap
+        }
+    }
+}
+
+#[proc_macro]
+pub fn router(input: TokenStream) -> TokenStream {
+    let r = syn::parse_macro_input!(input as Router);
+    let fallback = match &r.fallback {
+        Some(f) => quote! { #f },
+        None => {
+            return syn::Error::new(Span::call_site(), "router! 需要 `fallback = <返回 View 的 fn>`")
+                .to_compile_error()
+                .into()
+        }
+    };
+    emit_route_table(&r.layout, &fallback, &r.items).into()
+}
+
+// ───────────────────────── platform!(统一装配:路由 + 数据 + 订阅 + 任务 → AppRuntime)─────────────────────────
+// 顶层关注点并列:
+//   routes { layout=, pages..., group(){}, fallback= }   Web 路由表(页面多时收进 routes 段,顶层不嘈杂)
+//   resolve = <fn>                                        GraphQL resolver(缺省 = rui::empty_resolver)
+//   subscribe { snapshot = <fn>, feed = <fn> }            SSE 订阅(可选)
+//   jobs { path::a, path::b }                             后台 AsyncJob(可选)
+// 路由项(layout/pages/group/fallback)也可直接平铺在顶层(向后兼容:小应用不必包 routes{})。
+// 生成 `route()`(同构)+ `pub fn app() -> rui::AppRuntime`(+ jobs 的 run_job;一处声明、bin 一行 `serve(app())`)。
+// 取代「`router!` 生成 route + bin/ssr.rs 手搓 `App { .. }`」的分散装配。JSON API 是 GraphQL(/graphql),不在此声明。
+// 解析单个路由项(layout= / fallback= / group(){} / 页路径):platform! 顶层平铺与 `routes { }` 段内共用。
+fn parse_routing_item(
+    input: ParseStream,
+    layout: &mut Option<syn::Path>,
+    fallback: &mut Option<syn::Path>,
+    items: &mut Vec<RouterItem>,
+) -> syn::Result<()> {
+    let is_group = input.peek(Ident)
+        && input.peek2(syn::token::Paren)
+        && input.fork().parse::<Ident>().map(|i| i == "group").unwrap_or(false);
+    if is_group {
+        input.parse::<Ident>()?; // group
+        let head;
+        syn::parenthesized!(head in input);
+        let prefix: LitStr = head.parse()?;
+        head.parse::<Token![,]>()?;
+        let lkw: Ident = head.parse()?;
+        if lkw != "layout" {
+            return Err(syn::Error::new(lkw.span(), "group(...) 里只支持 layout = <fn>"));
+        }
+        head.parse::<Token![=]>()?;
+        let glayout: syn::Path = head.parse()?;
+        let gbody;
+        syn::braced!(gbody in input);
+        let mut pages = Vec::new();
+        while !gbody.is_empty() {
+            pages.push(gbody.parse::<syn::Path>()?);
+            if gbody.peek(Token![,]) {
+                gbody.parse::<Token![,]>()?;
+            }
+        }
+        if pages.is_empty() {
+            return Err(syn::Error::new(prefix.span(), "group(...) 至少需要一个成员页"));
+        }
+        items.push(RouterItem::Group { prefix: prefix.value(), layout: glayout, pages });
+    } else if input.peek(Ident) && input.peek2(Token![=]) {
+        let kw: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let val: syn::Path = input.parse()?;
+        match kw.to_string().as_str() {
+            "layout" => *layout = Some(val),
+            "fallback" => *fallback = Some(val),
+            other => {
+                return Err(syn::Error::new(
+                    kw.span(),
+                    format!("路由项只支持 layout= / fallback= / group(){{}} / 页路径,收到 `{other}`(resolve= / subscribe{{}} / jobs{{}} 放在 platform! 顶层,不在 routes 内)"),
+                ))
+            }
+        }
+    } else {
+        if input.peek(Ident) && input.peek2(syn::token::Paren) {
+            let id: Ident = input.fork().parse()?;
+            return Err(syn::Error::new(
+                id.span(),
+                format!("页条目必须是页路径(如 `pages::index`);路由组用 `group(\"/前缀\", layout = <fn>) {{ ... }}`,收到 `{id}(...)`"),
+            ));
+        }
+        items.push(RouterItem::Page(input.parse::<syn::Path>()?));
+    }
+    Ok(())
+}
+
+struct Platform {
+    layout: Option<syn::Path>,
+    fallback: Option<syn::Path>,
+    items: Vec<RouterItem>,
+    resolve: Option<syn::Path>,
+    subscribe: Option<(syn::Path, syn::Path)>, // (snapshot, feed)
+    jobs: Vec<syn::Path>,                      // jobs { path::a, path::b } → 后台 AsyncJob
+    crons: Vec<syn::Path>,                     // crons { path::a } → 定时任务(#[rui::cron])
+    database: Option<String>,                  // database = postgres → 部署模型里的 DB 资源
+}
+impl Parse for Platform {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut layout = None;
+        let mut fallback = None;
+        let mut items = Vec::new();
+        let mut resolve = None;
+        let mut subscribe = None;
+        let mut jobs: Vec<syn::Path> = Vec::new();
+        let mut crons: Vec<syn::Path> = Vec::new();
+        let mut database: Option<String> = None;
+        while !input.is_empty() {
+            let is_kw = |name: &str| {
+                input.peek(Ident) && input.fork().parse::<Ident>().map(|i| i == name).unwrap_or(false)
+            };
+            if is_kw("subscribe") && input.peek2(syn::token::Brace) {
+                input.parse::<Ident>()?; // subscribe
+                let sbody;
+                syn::braced!(sbody in input);
+                let mut snap: Option<syn::Path> = None;
+                let mut feed: Option<syn::Path> = None;
+                while !sbody.is_empty() {
+                    let k: Ident = sbody.parse()?;
+                    sbody.parse::<Token![=]>()?;
+                    let v: syn::Path = sbody.parse()?;
+                    match k.to_string().as_str() {
+                        "snapshot" => snap = Some(v),
+                        "feed" => feed = Some(v),
+                        o => {
+                            return Err(syn::Error::new(
+                                k.span(),
+                                format!("subscribe {{ }} 只支持 snapshot = .. / feed = ..,收到 `{o}`"),
+                            ))
+                        }
+                    }
+                    if sbody.peek(Token![,]) {
+                        sbody.parse::<Token![,]>()?;
+                    }
+                }
+                let snap = snap
+                    .ok_or_else(|| syn::Error::new(Span::call_site(), "subscribe { } 缺 snapshot = .."))?;
+                let feed =
+                    feed.ok_or_else(|| syn::Error::new(Span::call_site(), "subscribe { } 缺 feed = .."))?;
+                subscribe = Some((snap, feed));
+            } else if is_kw("jobs") && input.peek2(syn::token::Brace) {
+                input.parse::<Ident>()?; // jobs
+                let jbody;
+                syn::braced!(jbody in input);
+                while !jbody.is_empty() {
+                    jobs.push(jbody.parse::<syn::Path>()?);
+                    if jbody.peek(Token![,]) {
+                        jbody.parse::<Token![,]>()?;
+                    }
+                }
+            } else if is_kw("crons") && input.peek2(syn::token::Brace) {
+                input.parse::<Ident>()?; // crons
+                let cbody;
+                syn::braced!(cbody in input);
+                while !cbody.is_empty() {
+                    crons.push(cbody.parse::<syn::Path>()?);
+                    if cbody.peek(Token![,]) {
+                        cbody.parse::<Token![,]>()?;
+                    }
+                }
+            } else if is_kw("routes") && input.peek2(syn::token::Brace) {
+                // routes { layout=, pages..., group(){}, fallback= }:把路由表整体收进来,顶层更清爽。
+                input.parse::<Ident>()?; // routes
+                let rbody;
+                syn::braced!(rbody in input);
+                while !rbody.is_empty() {
+                    parse_routing_item(&rbody, &mut layout, &mut fallback, &mut items)?;
+                    if rbody.peek(Token![,]) {
+                        rbody.parse::<Token![,]>()?;
+                    }
+                }
+            } else if is_kw("resolve") && input.peek2(Token![=]) {
+                input.parse::<Ident>()?; // resolve
+                input.parse::<Token![=]>()?;
+                resolve = Some(input.parse::<syn::Path>()?);
+            } else if is_kw("database") && input.peek2(Token![=]) {
+                input.parse::<Ident>()?; // database
+                input.parse::<Token![=]>()?;
+                let kind: Ident = input.parse()?; // database = postgres
+                let k = kind.to_string();
+                if k != "postgres" {
+                    return Err(syn::Error::new(kind.span(), format!("platform! database 第一版只支持 `postgres`,收到 `{k}`")));
+                }
+                database = Some(k);
+            } else {
+                // 顶层平铺的路由项(layout= / fallback= / group(){} / 页路径):向后兼容(小应用不必包 routes{})。
+                parse_routing_item(input, &mut layout, &mut fallback, &mut items)?;
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Platform { layout, fallback, items, resolve, subscribe, jobs, crons, database })
+    }
+}
+
+#[proc_macro]
+pub fn platform(input: TokenStream) -> TokenStream {
+    let p = syn::parse_macro_input!(input as Platform);
+    let fallback = match &p.fallback {
+        Some(f) => quote! { #f },
+        None => {
+            return syn::Error::new(Span::call_site(), "platform! 需要 `fallback = <返回 View 的 fn>`")
+                .to_compile_error()
+                .into()
+        }
+    };
+    let route_table = emit_route_table(&p.layout, &fallback, &p.items);
+    // resolve 缺省 = empty_resolver(无数据层的最小骨架);subscribe 可选。
+    let resolve_tok = match &p.resolve {
+        Some(r) => quote! { #r },
+        None => quote! { rui::empty_resolver },
+    };
+    let sse_tok = match &p.subscribe {
+        Some((snap, feed)) => {
+            quote! { ::std::option::Option::Some(rui::Sse { snapshot: #snap, subscribe: #feed }) }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
+    // jobs + crons 都是 Job(cron 的 payload 固定 CronTick)→ 合并进 run_job 分发器(按 NAME 解码 payload → 调 run)。
+    let dispatch_paths: Vec<&syn::Path> = p.jobs.iter().chain(p.crons.iter()).collect();
+    let run_job_fn = if dispatch_paths.is_empty() {
+        quote! {}
+    } else {
+        let dp = &dispatch_paths;
+        quote! {
+            #[cfg(not(target_arch = "wasm32"))]
+            pub fn run_job(__name: &str, __ctx: &rui::JobCtx, __json: &str) -> ::std::option::Option<rui::JobResult> {
+                #(
+                    if __name == <#dp as rui::Job>::NAME {
+                        let __p = <<#dp as rui::Job>::Payload as rui::gql::FromValue>::from_value(&rui::gql::parse(__json));
+                        return ::std::option::Option::Some(<#dp as rui::Job>::run(__ctx, __p));
+                    }
+                )*
+                ::std::option::Option::None
+            }
+        }
+    };
+    let register_jobs = if dispatch_paths.is_empty() {
+        quote! {}
+    } else {
+        quote! { rui::set_job_dispatch(run_job); }
+    };
+    // crons:登记 (NAME, 间隔秒) 给 scheduler(serve 启动 scheduler 线程按间隔 enqueue → worker 执行)。
+    let cron_paths = &p.crons;
+    let register_crons = if p.crons.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            rui::set_crons(::std::vec![ #( (<#cron_paths as rui::Job>::NAME, <#cron_paths as rui::CronJob>::INTERVAL_SECS) ),* ]);
+        }
+    };
+    // describe():部署模型(Pillar 3)。运行时读各原语的编译期常量(路由模式/策略、job NAME、cron 间隔、database)
+    // 拼出 AppModel,供 `rui plan`(= `cargo run -- plan`)打印部署 DAG + provision plan。
+    let mut route_nodes: Vec<TS2> = Vec::new();
+    for item in &p.items {
+        match item {
+            RouterItem::Page(path) => route_nodes.push(quote! {
+                rui::deploy::RouteNode { pattern: #path::__RUI_PATTERN.to_string(), strategy: #path::__RUI_STRATEGY }
+            }),
+            RouterItem::Group { prefix, pages, .. } => {
+                for m in pages {
+                    route_nodes.push(quote! {
+                        rui::deploy::RouteNode {
+                            pattern: ::std::format!("{}{}", #prefix, #m::__RUI_PATTERN),
+                            strategy: #m::__RUI_STRATEGY,
+                        }
+                    });
+                }
+            }
+        }
+    }
+    let graphql_lit = p.resolve.is_some();
+    let sse_lit = p.subscribe.is_some();
+    let db_expr = match &p.database {
+        Some(k) => quote! { ::std::option::Option::Some(#k.to_string()) },
+        None => quote! { ::std::option::Option::None },
+    };
+    let job_names: Vec<TS2> = p.jobs.iter().map(|j| quote! { <#j as rui::Job>::NAME.to_string() }).collect();
+    let cron_nodes: Vec<TS2> = p
+        .crons
+        .iter()
+        .map(|c| quote! { rui::deploy::CronNode { name: <#c as rui::Job>::NAME.to_string(), interval_secs: <#c as rui::CronJob>::INTERVAL_SECS } })
+        .collect();
+    let describe_fn = quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn describe() -> rui::AppModel {
+            rui::AppModel {
+                routes: ::std::vec![ #(#route_nodes),* ],
+                graphql: #graphql_lit,
+                sse: #sse_lit,
+                database: #db_expr,
+                jobs: ::std::vec![ #(#job_names),* ],
+                crons: ::std::vec![ #(#cron_nodes),* ],
+            }
+        }
+    };
+    quote! {
+        #route_table
+        #run_job_fn
+        #describe_fn
+        // 统一装配:一处声明路由 + 数据 + 订阅 + 后台任务 + 定时任务 → AppRuntime(取代 bin 里手搓 `App { .. }`)。仅服务端。
+        #[cfg(not(target_arch = "wasm32"))]
+        pub fn app() -> rui::AppRuntime {
+            #register_jobs
+            #register_crons
+            rui::AppRuntime { route, resolve: #resolve_tok, sse: #sse_tok }
         }
     }
     .into()
@@ -1954,10 +2505,19 @@ impl Parse for FieldList {
     }
 }
 
+// Relay connection 通用字段 marker:`#[derive(Ent)]` 自动生成的 <E>Edge/<E>Connection/<E>PageInfo
+// 都依赖这 6 个,且它们跨所有实体共享(每实体各 emit 一份会重复定义)→ 由 gql_fields! 统一注入一次。
+// 对用户显式列表去重:旧代码若仍列出它们也不会重复定义;用户自有同名 domain 字段同样复用这一份 marker。
+const RELAY_FIELD_MARKERS: [&str; 6] =
+    ["edges", "node", "cursor", "page_info", "has_next_page", "end_cursor"];
+
 #[proc_macro]
 pub fn gql_fields(input: TokenStream) -> TokenStream {
     let FieldList(names) = syn::parse_macro_input!(input as FieldList);
-    let decls = names.iter().map(|n| quote! { pub struct #n; });
+    // 用户字段:剔除与 Relay 保留 marker 同名的(避免与下方自动注入重复定义)。
+    let user = names.into_iter().filter(|n| !RELAY_FIELD_MARKERS.contains(&n.to_string().as_str()));
+    let relay = RELAY_FIELD_MARKERS.iter().map(|m| Ident::new(m, Span::call_site()));
+    let decls = user.map(|n| quote! { pub struct #n; }).chain(relay.map(|n| quote! { pub struct #n; }));
     quote! {
         #[allow(non_camel_case_types, dead_code)]
         pub mod gqlf { #(#decls)* }
@@ -1965,29 +2525,25 @@ pub fn gql_fields(input: TokenStream) -> TokenStream {
     .into()
 }
 
-// ───────────────────────── #[derive(GqlObject)] ─────────────────────────
-#[proc_macro_derive(GqlObject, attributes(gql))]
-pub fn derive_gql_object(input: TokenStream) -> TokenStream {
-    let input = syn::parse_macro_input!(input as DeriveInput);
+// ───────────────────────── #[derive(GqlObject)] / #[derive(Ent)] ─────────────────────────
+// 共享:解析具名 struct 的字段 + #[gql(id)] 主键标记(GqlObject 与 Ent 复用同一份字段枚举逻辑)。
+struct GqlStruct<'a> {
+    name: &'a Ident,
+    name_str: String,
+    idents: Vec<&'a Ident>,
+    names: Vec<String>,
+    types: Vec<&'a Type>,
+    id_field: Option<Ident>,
+}
+fn parse_gql_struct(input: &DeriveInput) -> syn::Result<GqlStruct<'_>> {
     let name = &input.ident;
-    let name_str = name.to_string();
-
     let fields = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(n) => &n.named,
-            _ => {
-                return syn::Error::new_spanned(name, "GqlObject 仅支持具名字段 struct")
-                    .to_compile_error()
-                    .into()
-            }
+            _ => return Err(syn::Error::new_spanned(name, "仅支持具名字段 struct")),
         },
-        _ => {
-            return syn::Error::new_spanned(name, "GqlObject 仅支持 struct")
-                .to_compile_error()
-                .into()
-        }
+        _ => return Err(syn::Error::new_spanned(name, "仅支持 struct")),
     };
-
     let mut id_field: Option<Ident> = None;
     for f in fields {
         for attr in &f.attrs {
@@ -2001,30 +2557,32 @@ pub fn derive_gql_object(input: TokenStream) -> TokenStream {
             }
         }
     }
-    // id 可选:无 #[gql(id)] 的是 value object(如 Connection/Edge/PageInfo),
-    // gql_id 返回 Null → entity_key 为 None → 不被规范化为独立 entity(随父内联)。
-    let id_tokens = match &id_field {
-        Some(i) => quote! { rui::gql::IntoValue::into_value(&self.#i) },
-        None => quote! { rui::gql::Value::Null },
-    };
-
     let idents: Vec<&Ident> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
     let names: Vec<String> = idents.iter().map(|i| i.to_string()).collect();
     let types: Vec<&Type> = fields.iter().map(|f| &f.ty).collect();
+    Ok(GqlStruct { name, name_str: name.to_string(), idents, names, types, id_field })
+}
 
-    let field_impls = idents.iter().zip(types.iter()).map(|(id, ty)| {
+// 同构类型层 + 编解码(GqlObject/GqlElem/Reshape/Field/IntoValue/FromValue);两端可见,wasm 也展开。
+fn emit_gql_object(s: &GqlStruct) -> TS2 {
+    let (name, name_str) = (s.name, &s.name_str);
+    // id 可选:无 #[gql(id)] 的是 value object(Connection/Edge/PageInfo),gql_id=Null → 不规范化为独立 entity。
+    let id_tokens = match &s.id_field {
+        Some(i) => quote! { rui::gql::IntoValue::into_value(&self.#i) },
+        None => quote! { rui::gql::Value::Null },
+    };
+    let field_impls = s.idents.iter().zip(s.types.iter()).map(|(id, ty)| {
         quote! { impl rui::gql::Field<crate::__rui_registry::fields::#id> for #name { type Ty = #ty; } }
     });
-    let field_arms = idents.iter().zip(names.iter()).map(|(id, nm)| {
+    let field_arms = s.idents.iter().zip(s.names.iter()).map(|(id, nm)| {
         quote! { #nm => Some(rui::gql::IntoValue::into_value(&self.#id)), }
     });
-    let into_pairs = idents.iter().zip(names.iter()).map(|(id, nm)| {
+    let into_pairs = s.idents.iter().zip(s.names.iter()).map(|(id, nm)| {
         quote! { (#nm.to_string(), rui::gql::IntoValue::into_value(&self.#id)), }
     });
-    let from_assigns = idents.iter().zip(names.iter()).map(|(id, nm)| {
+    let from_assigns = s.idents.iter().zip(s.names.iter()).map(|(id, nm)| {
         quote! { #id: rui::gql::FromValue::from_value(v.field(#nm)), }
     });
-
     quote! {
         impl rui::gql::GqlObject for #name {
             const TYPENAME: &'static str = #name_str;
@@ -2054,6 +2612,166 @@ pub fn derive_gql_object(input: TokenStream) -> TokenStream {
         impl rui::gql::FromValue for #name {
             fn from_value(v: &rui::gql::Value) -> Self {
                 #name { #(#from_assigns)* }
+            }
+        }
+    }
+}
+
+// 合成一个 value object(无 entity id)的**完整**定义:`pub struct` 本身 + emit_gql_object 的全套 impl
+//(GqlObject/GqlElem/Reshape/Field/IntoValue/FromValue)。用于 #[derive(Ent)] 自动生成 Edge/Connection/PageInfo —
+// 这些类型用户不写,故定义与 impl 都由宏产出(对比 #[derive(GqlObject)] 只产 impl、struct 是用户手写的)。
+fn emit_relay_value_object(name: &Ident, field_idents: &[Ident], field_types: &[Type]) -> TS2 {
+    let name_str = name.to_string();
+    let idents: Vec<&Ident> = field_idents.iter().collect();
+    let names: Vec<String> = field_idents.iter().map(|i| i.to_string()).collect();
+    let types: Vec<&Type> = field_types.iter().collect();
+    let gs = GqlStruct { name, name_str, idents, names, types, id_field: None };
+    let impls = emit_gql_object(&gs);
+    quote! {
+        #[derive(Clone)]
+        #[allow(dead_code)]
+        pub struct #name { #(pub #field_idents: #field_types),* }
+        #impls
+    }
+}
+
+#[proc_macro_derive(GqlObject, attributes(gql))]
+pub fn derive_gql_object(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    match parse_gql_struct(&input) {
+        Ok(s) => emit_gql_object(&s).into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+// #[derive(Ent)] = 单一真相源:同一个 struct 同时是 GraphQL 对象类型(emit_gql_object,同构)
+// + 表映射(SqlEntity,native)。取代 GqlObject + async-graphql SimpleObject + sqlx FromRow 三重 derive。
+//   #[derive(rui::Ent)] #[ent(table = "todos")] struct Todo { #[gql(id)] id: String, text: String, done: bool }
+// 默认 GraphQL 字段名 = SQL 列名;主键取 #[gql(id)] 字段。selection→SQL 列投影由 gql::orm 在运行期完成。
+// 此外**自动生成** Relay 分页三件套 <E>Edge/<E>PageInfo/<E>Connection + native 切片器 <E>Connection::page —— 见下方。
+// 约束:实体须 `#[derive(Clone)]`(生成的 <E>Edge 持有并 clone 实体作 node);主键类型须实现 Display(游标 = 主键.to_string())。
+#[proc_macro_derive(Ent, attributes(gql, ent))]
+pub fn derive_ent(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    let s = match parse_gql_struct(&input) {
+        Ok(s) => s,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    // 表名:#[ent(table = "...")](struct 级,必填)。
+    let mut table: Option<String> = None;
+    for attr in &input.attrs {
+        if attr.path().is_ident("ent") {
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("table") {
+                    let v: LitStr = meta.value()?.parse()?;
+                    table = Some(v.value());
+                }
+                Ok(())
+            });
+        }
+    }
+    let name = s.name;
+    let table = match table {
+        Some(t) => t,
+        None => {
+            return syn::Error::new_spanned(name, "#[derive(Ent)] 需要 #[ent(table = \"表名\")]")
+                .to_compile_error()
+                .into()
+        }
+    };
+    // 主键:取 #[gql(id)] 字段(同 GqlObject 的 entity id);ORM 列投影恒并入它(store 规范化 __id 需要)。
+    let pk = match &s.id_field {
+        Some(i) => i.to_string(),
+        None => {
+            return syn::Error::new_spanned(name, "#[derive(Ent)] 需要一个 #[gql(id)] 字段作主键")
+                .to_compile_error()
+                .into()
+        }
+    };
+    let cols = &s.names; // 全部字段名 = 列名(默认同名)
+    let pk_ident = s.id_field.clone().expect("上文已校验存在 #[gql(id)] 字段"); // 主键字段(分页游标取它)
+    let pk_ty: &Type = {
+        let p = s.idents.iter().position(|i| **i == pk_ident).expect("主键字段必在字段列表中");
+        s.types[p] // 主键类型:分页游标 = 主键.to_string(),编译期断言它实现 Display
+    };
+    let gqlobj = emit_gql_object(&s);
+
+    // Relay connection 三件套(自动生成,用户不再手写):cursor = 主键值的字符串形式。
+    //   <E>Edge { node: <E>, cursor: String }
+    //   <E>PageInfo { has_next_page: bool, end_cursor: String }   ← 每实体一份(共享 PageInfo 无法 impl Field<app::fields::..>)
+    //   <E>Connection { edges: Vec<<E>Edge>, page_info: <E>PageInfo }
+    // 三者依赖的 6 个通用 marker(edges/node/cursor/page_info/has_next_page/end_cursor)由 gql_fields! 自动注入。
+    let edge = Ident::new(&format!("{name}Edge"), name.span());
+    let page_info = Ident::new(&format!("{name}PageInfo"), name.span());
+    let conn = Ident::new(&format!("{name}Connection"), name.span());
+    let sp = name.span();
+    let id_ = |s: &str| Ident::new(s, sp);
+    let edge_obj = emit_relay_value_object(
+        &edge,
+        &[id_("node"), id_("cursor")],
+        &[parse_quote!(#name), parse_quote!(String)],
+    );
+    let page_info_obj = emit_relay_value_object(
+        &page_info,
+        &[id_("has_next_page"), id_("end_cursor")],
+        &[parse_quote!(bool), parse_quote!(String)],
+    );
+    let conn_obj = emit_relay_value_object(
+        &conn,
+        &[id_("edges"), id_("page_info")],
+        &[parse_quote!(::std::vec::Vec<#edge>), parse_quote!(#page_info)],
+    );
+
+    quote! {
+        #gqlobj
+        #edge_obj
+        #page_info_obj
+        #conn_obj
+        // 编译期友好诊断:把「实体须 Clone / 主键须 Display」的约束指回实体定义(#name 带用户 span),
+        // 而非让错误落在生成的 #[derive(Clone)] 或 page() 里的 .to_string()(指向宏展开代码,难懂)。
+        #[cfg(not(target_arch = "wasm32"))]
+        const _: fn() = || {
+            fn __rui_ent_requires_clone<T: ::core::clone::Clone>() {}
+            fn __rui_pk_requires_display<T: ::core::fmt::Display>() {}
+            __rui_ent_requires_clone::<#name>();
+            __rui_pk_requires_display::<#pk_ty>();
+        };
+        // 表映射:仅服务端(SqlEntity 在 gql::orm,native-only)。wasm 端只有上面同构的 GraphQL 类型层。
+        #[cfg(not(target_arch = "wasm32"))]
+        impl rui::gql::orm::SqlEntity for #name {
+            const TABLE: &'static str = #table;
+            const PK: &'static str = #pk;
+            const COLUMNS: &'static [&'static str] = &[ #(#cols),* ];
+        }
+        // Relay 游标分页(仅服务端):resolver 一行 `#conn::page(first, &after)` 即得一页 connection。
+        // 内存切片(Relay keyset 下推是后续阶段):取全列、按主键稳定排序,游标 = 主键值;after 为空取首页。
+        #[cfg(not(target_arch = "wasm32"))]
+        impl #conn {
+            #[allow(dead_code)]
+            pub fn page(first: i64, after: &str) -> ::std::vec::Vec<#conn> {
+                let __all = rui::gql::orm::fetch_full::<#name>(rui::gql::orm::Q::new().order(#pk));
+                let __start = if after.is_empty() {
+                    0
+                } else {
+                    __all.iter()
+                        .position(|__t| __t.#pk_ident.to_string() == after)
+                        .map(|__i| __i + 1)
+                        .unwrap_or(__all.len())
+                };
+                // first<=0 → __first=0 → 空页 + has_next_page=false(自洽,不返回「空页却称还有下一页」);
+                // saturating_add 防 first 极大时 usize 溢出 panic(debug)。
+                let __first = first.max(0) as usize;
+                let __end = __start.saturating_add(__first).min(__all.len());
+                let __slice = &__all[__start..__end];
+                let __edges: ::std::vec::Vec<#edge> = __slice
+                    .iter()
+                    .map(|__t| #edge { node: ::core::clone::Clone::clone(__t), cursor: __t.#pk_ident.to_string() })
+                    .collect();
+                let __end_cursor = __slice.last().map(|__t| __t.#pk_ident.to_string()).unwrap_or_default();
+                ::std::vec![#conn {
+                    edges: __edges,
+                    page_info: #page_info { has_next_page: __first > 0 && __end < __all.len(), end_cursor: __end_cursor },
+                }]
             }
         }
     }

@@ -1,54 +1,29 @@
 //! todo —— 用 rui 框架搭的 TodoList 应用(crate 名沿用 stocks,内容是 todo)。
 //! 用上框架全部能力:GraphQL(query!/mutation!/subscription!/paginated!/fragment!)+ 规范化缓存、
-//! 同构 SSR + 真水合 + 数据交接、渲染策略标注(#[rui::page] ssr/csr/static)、组件(具名 props+children)、
-//! keyed <For>、<Show>/<Switch>、IntoView 表达式条件、响应式属性、bind:value、memo。
+//! 同构 SSR + 真水合 + 数据交接、渲染策略(#[rui::page] ssr/csr/static)、组件、keyed <For>、
+//! <Show>/<Switch>、IntoView 条件、bind:value、memo、<Transition>、AsyncJob。
+//!
+//! **App 装配集中在 `app.rs`**(platform! 声明路由/数据/订阅/jobs → app());本文件只做
+//! 模块声明 + crate 根级注册(有路径约束、必须在根)+ 装配入口 re-export。
 
 pub mod api;
 pub mod data;
+mod app; // App 装配:platform!(路由 + resolve + 订阅 + jobs)+ client! 客户端入口 + 404
 mod view;
 
-// app registry:把宏依赖的四个逻辑模块映射到本应用的实际路径(此处全用默认约定;改目录 / 跨 crate 时在此覆盖)。
-// 宏不再硬编码 crate::view::components 等,而是统一引用 crate::__rui_registry::{components,model,schema,fields}。
+// crate 根级注册(有路径约束,必须在 crate 根):
+//   · `app! {}` 生成 `crate::__rui_registry`(所有消费宏统一引用),把 components/model/schema/fields
+//     映射到应用实际目录(此处全用默认约定;改目录 / 跨 crate 时在此覆盖)。宏放哪生成哪 → 只能在根。
+//   · `gql_fields!` 声明全部 GraphQL 字段名 marker(= 注册表默认的 fields 路径 `crate::gqlf`)。
 rui::app! {}
-
-// 字段 marker:gql_root 为每个方法生成 Field<gqlf::方法名>,故所有 query/mutation/subscription 字段名 + 数据字段都要在此声明。
 rui::gql_fields!(
     id, text, done, todos, todo_page, search, detail, add_todo, toggle_todo, remove_todo, clear_done, complete_all,
-    todo_updates, edges, node, cursor, page_info, has_next_page, end_cursor
+    todo_updates
 );
 
-rui::client!(crate::route);
-
-use view::{layout, pages};
-
-// 路由表 = 候选页清单。路由模式声明在各 page 的 #[rui::page("/...")] 上(唯一真相源);
-// 这里只列出哪些页参与路由 + 命中页用 navbar 外壳(layout)包裹。生成 `pub fn route(path)->Page`。
-rui::router! {
-    layout = layout::shell,
-    pages::index,
-    pages::archive,
-    pages::detail, // /todo/:id —— 路由参数,模式 + 类型化签名都在 detail.rs
-    // 路由组:/dash 与 /dash/settings 共享 dash_shell 侧栏(组内导航不重建侧栏,只换内层 outlet)。
-    // 组专属布局 dash_shell 与组的页面同住在 view/pages/dash/(不在全局 layout.rs)。
-    group("/dash", layout = pages::dash::dash_shell) {
-        pages::dash::overview, // /dash
-        pages::dash::settings, // /dash/settings
-    },
-    pages::about,
-    pages::draft,
-    pages::boundary, // /boundary —— <ErrorBoundary> 演示
-    pages::forms,    // /forms —— 表单(bind:value/checked/group + select + 校验)
-    pages::transitions, // /transitions —— <Transition> 进出场动画
-    fallback = not_found,
-}
-
-fn not_found() -> rui::View {
-    use rui::dom::{attr, el, set_text};
-    let d = el("div");
-    attr(d, "class", "text-2xl");
-    set_text(d, "404 · 页面不存在");
-    rui::View(d)
-}
-
-// 注:增删改用 mutation! 宏(现已支持运行时参数,如 toggle_todo(id: id)),无需手搓 GraphQL 串。
-// 列表是 subscription! 驱动:服务端任何写操作都会广播 → 订阅推新列表 → UI 自动反映增删改。
+// 装配入口 re-export:
+//   · `route`(同构):页面里 `rui::go(crate::route, ..)` 程序化导航用;客户端 / SSR 都需要。
+//   · `app()`(仅服务端):bin/ssr.rs 用 `rui::serve_axum(stocks::app())`。
+pub use app::route;
+#[cfg(not(target_arch = "wasm32"))]
+pub use app::{app, describe}; // app(): 启动;describe(): 部署模型(rui plan / cargo run -- plan)

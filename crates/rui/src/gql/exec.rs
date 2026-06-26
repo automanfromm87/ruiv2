@@ -100,6 +100,26 @@ pub fn empty_resolver(_kind: OpKind, _field: &str, _args: &Args) -> Value {
 thread_local! {
     static ERRORS: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) };
     static CUR_FIELD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    // 当前根字段的子 selection(真字段名,剔除 __typename/__id):resolver / ORM 据此把 selection 下推成 SQL 列投影。
+    // 与 CUR_FIELD 同生命周期:每个根字段调 resolver 前由 execute 设好;同线程不可重入(thread-per-conn)。
+    static CUR_SEL: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 当前正在 resolve 的根字段所选的子字段名(真名,已剔除 __typename/__id)。
+/// ORM 层(gql::orm)据此把 GraphQL selection 下推成 SQL 列投影(`{id}` → `select id`);
+/// 空表示「未在执行上下文内 / 未选具体字段」→ ORM 回退取全列。仅服务端执行期有意义。
+pub fn current_selection() -> Vec<String> {
+    CUR_SEL.with(|s| s.borrow().clone())
+}
+
+fn set_current_selection(sel: &[Field]) {
+    CUR_SEL.with(|s| {
+        *s.borrow_mut() = sel
+            .iter()
+            .map(|f| f.name.clone()) // 用真名(非别名):列投影按真实字段名
+            .filter(|n| n != "__typename" && n != "__id")
+            .collect();
+    });
 }
 
 /// resolver 主动报一个 GraphQL 错误:进本次响应的 `errors[]`(path 取当前根字段);该字段通常返回空/默认值。
@@ -145,6 +165,7 @@ pub fn execute(req: &str, resolve: Resolver) -> String {
             let args = Args(&f.args);
             let key = f.alias.clone().unwrap_or_else(|| f.name.clone());
             CUR_FIELD.with(|cf| *cf.borrow_mut() = f.name.clone()); // 供 report_error / panic 取 path
+            set_current_selection(&f.selection); // 供 resolver/ORM 做 selection→SQL 列投影下推
             // 隔离 resolver + 投影的 panic:都包进 catch_unwind(project 在 catch 外则它 panic 会逃逸杀连接)。
             // panic 不杀线程、转成 errors[] 条目 + 该字段 null,其余字段照常(标准 partial data)。
             // 注:AssertUnwindSafe 只是「保证 panic 安全」的承诺 —— resolver 持锁 panic 仍会毒化该 Mutex,

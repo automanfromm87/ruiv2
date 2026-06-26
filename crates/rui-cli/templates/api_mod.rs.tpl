@@ -19,8 +19,8 @@
 //!            }
 //!        }
 //!   2. 数据实现按领域建文件(如 `todos.rs`),`#[cfg(not(target_arch = "wasm32"))] pub mod todos;`。
-//!   3. 在 crate 根 lib.rs 用 `rui::gql_fields!(字段名...)` 声明字段 marker。
-//!   4. 把 `bin/ssr.rs` 的 `rui::empty_resolver` 换成 `<你的包名>::api::schema::resolve`。
+//!   3. 在 crate 根 lib.rs 加 `rui::app! {}`(注册表)+ `rui::gql_fields!(字段名...)`(字段 marker)。
+//!   4. 在 src/app.rs 的 `platform! { .. }` 里加 `resolve = crate::api::schema::resolve,`(要 SSE 订阅则加 `subscribe { snapshot = .., feed = .. }`)。
 
 // pub mod schema;
 // #[cfg(not(target_arch = "wasm32"))] pub mod todos;

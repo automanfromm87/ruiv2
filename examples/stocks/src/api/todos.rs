@@ -1,119 +1,18 @@
-//! 待办数据后端(仅服务端):内存 store + 增删改 + SSE 订阅广播 + 游标分页。
-//! 被 crate::api::schema 的 #[gql_root] 方法体调用;每次写操作都 broadcast(),订阅者(/live、首页)实时刷新。
-use crate::data::model::{PageInfo, Todo, TodoConnection, TodoEdge};
+//! SSE 订阅广播(仅服务端)。数据存取已移到 ORM(rui::gql::orm + 注入的 DbExecutor);
+//! 这里只管订阅者集合 + 快照广播:任一写操作后 schema 的 mutation 调 broadcast(),订阅者(首页 subscription!)实时刷新。
+use crate::data::model::Todo;
 use rui::gql::value::{IntoValue, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
-fn seed() -> Vec<Todo> {
-    [
-        ("1", "学习 rui 框架", true),
-        ("2", "用它写个 todolist", false),
-        ("3", "配合 tailwind 调样式", false),
-    ]
-    .iter()
-    .map(|(id, t, d)| Todo { id: id.to_string(), text: t.to_string(), done: *d })
-    .collect()
-}
-
-fn store() -> &'static Mutex<Vec<Todo>> {
-    static S: OnceLock<Mutex<Vec<Todo>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(seed()))
-}
 fn subs() -> &'static Mutex<Vec<Sender<String>>> {
     static S: OnceLock<Mutex<Vec<Sender<String>>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(Vec::new()))
 }
-fn next_id() -> String {
-    static N: AtomicU64 = AtomicU64::new(100);
-    N.fetch_add(1, Ordering::Relaxed).to_string()
-}
 
-// ── 数据访问(schema 的 resolver 方法调用)──
-
-pub fn all() -> Vec<Todo> {
-    store().lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-pub fn add(text: &str) -> Vec<Todo> {
-    let text = text.trim();
-    if !text.is_empty() {
-        store().lock().unwrap_or_else(|e| e.into_inner()).push(Todo { id: next_id(), text: text.to_string(), done: false });
-        broadcast();
-    }
-    all()
-}
-
-pub fn toggle(id: &str) -> Vec<Todo> {
-    {
-        let mut v = store().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(t) = v.iter_mut().find(|t| t.id == id) {
-            t.done = !t.done;
-        }
-    }
-    broadcast();
-    all()
-}
-
-pub fn remove(id: &str) -> Vec<Todo> {
-    store().lock().unwrap_or_else(|e| e.into_inner()).retain(|t| t.id != id);
-    broadcast();
-    all()
-}
-
-pub fn clear_done() -> Vec<Todo> {
-    store().lock().unwrap_or_else(|e| e.into_inner()).retain(|t| !t.done);
-    broadcast();
-    all()
-}
-
-pub fn complete_all() -> Vec<Todo> {
-    {
-        let mut v = store().lock().unwrap_or_else(|e| e.into_inner());
-        for t in v.iter_mut() {
-            t.done = true;
-        }
-    }
-    broadcast();
-    all()
-}
-
-/// Relay 游标分页(归档页):cursor = id;after 为上一页最后一个 id(空 = 第一页)。
-pub fn page(first: i64, after: &str) -> Vec<TodoConnection> {
-    let all = store().lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let start = if after.is_empty() {
-        0
-    } else {
-        all.iter().position(|t| t.id == after).map(|i| i + 1).unwrap_or(all.len())
-    };
-    let end = (start + first.max(0) as usize).min(all.len());
-    let slice = &all[start..end];
-    let edges: Vec<TodoEdge> =
-        slice.iter().map(|t| TodoEdge { node: t.clone(), cursor: t.id.clone() }).collect();
-    let end_cursor = slice.last().map(|t| t.id.clone()).unwrap_or_default();
-    vec![TodoConnection { edges, page_info: PageInfo { has_next_page: end < all.len(), end_cursor } }]
-}
-
-/// 单条详情(/todo/:id):按 id 查,命中返回 1 条、否则空。
-pub fn detail(id: &str) -> Vec<Todo> {
-    store().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|t| t.id == id).cloned().collect()
-}
-
-/// 服务端按文本过滤(resource! 搜索演示):空串返回空。
-pub fn search(q: &str) -> Vec<Todo> {
-    let q = q.trim();
-    if q.is_empty() {
-        return Vec::new();
-    }
-    store().lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|t| t.text.contains(q)).cloned().collect()
-}
-
-// ── 订阅 / SSE ──
-
-/// SSE 推送 / 初值:标准 `{"data":{"todo_updates":[全字段]}}`。
+/// SSE 推送 / 初值:标准 `{"data":{"todo_updates":[全字段]}}`。读当前后端(PG / 内存)的全列快照。
 pub fn snapshot_json() -> String {
-    let todos = store().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let todos = rui::gql::orm::fetch_all::<Todo>();
     Value::Object(vec![(
         "data".to_string(),
         Value::Object(vec![("todo_updates".to_string(), todos.into_value())]),
@@ -127,7 +26,8 @@ pub fn add_subscriber() -> Receiver<String> {
     rx
 }
 
-fn broadcast() {
+/// 任一写操作后广播当前快照给所有订阅者(首页 subscription! 实时反映增删改;PG / 内存后端都生效)。
+pub fn broadcast() {
     let json = snapshot_json();
     subs().lock().unwrap_or_else(|e| e.into_inner()).retain(|tx| tx.send(json.clone()).is_ok());
 }

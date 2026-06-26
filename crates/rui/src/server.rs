@@ -42,16 +42,20 @@ pub struct Sse {
     pub subscribe: fn() -> Receiver<String>,
 }
 
-/// 一个 rui 应用:路由 + GraphQL resolver +(可选)订阅。
+/// 一个 rui 应用运行时:路由 + GraphQL resolver +(可选)订阅 +(可选)API 路由。
+/// 由 `rui::platform! { .. }` 一处声明生成的 `app()` 返回(取代手搓结构体);`serve` / `serve_axum` 收它启动。
 #[derive(Clone, Copy)]
-pub struct App {
-    /// 路径 → Page(策略 + 延迟渲染);由 `#[rui::page]` + route() 提供。
+pub struct AppRuntime {
+    /// 路径 → Page(策略 + 延迟渲染);由 `#[rui::page]` / `#[rui::route(ssr|csr|static)]` + route() 提供。
     pub route: fn(&str) -> crate::view::Page,
     /// GraphQL resolver(应用用一个 match 聚合 #[gql_root] 生成的各 Root::resolve)。
     pub resolve: Resolver,
     /// 可选订阅(subscription)。
     pub sse: Option<Sse>,
 }
+
+/// 向后兼容别名:旧代码的 `rui::App { .. }` 仍可用(推荐改用 `platform!` 生成的 `app() -> AppRuntime`)。
+pub type App = AppRuntime;
 
 // ── 宿主配置(AppConfig):把宿主级常量从硬编码变成可配置 —— 框架从「自带固定交付方式的模板」变成「引擎」。
 //    进程级 OnceLock(一服务一配置,启动设一次、只读;同 RESOLVE 模式)。所有字段 Default = 当前字面量,
@@ -177,6 +181,8 @@ pub fn serve(app: App) {
 pub fn serve_with(app: App, cfg: AppConfig) {
     set_config(cfg); // 必须在任何 config() 读取前设置
     set_resolver(app.resolve); // 让同构 SSR 的本地执行用同一个 resolver
+    crate::jobs::start_worker_if_configured(); // platform! 声明了 jobs/crons → 起后台 worker 线程
+    crate::jobs::start_crons_if_configured(); // platform! 声明了 crons → 起定时调度线程(按间隔 enqueue)
     let c = config();
     let listener = TcpListener::bind((c.bind.0.as_str(), c.bind.1)).expect("bind");
     println!("rui · SSR  →  http://{}:{}", c.bind.0, c.bind.1);

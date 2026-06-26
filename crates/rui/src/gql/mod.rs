@@ -32,6 +32,9 @@ pub mod store;
 pub mod exec;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod parser;
+// GraphQL-native ORM:#[derive(Ent)] 的表映射 + selection→SQL 投影 + 注入式 DbExecutor(仅服务端)。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod orm;
 
 /// 标量字段:exact-fit struct 的字段类型 = `<字段类型 as Scalar>::Out`。
 pub trait Scalar {

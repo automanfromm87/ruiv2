@@ -30,6 +30,8 @@ pub fn serve_axum(app: App) {
 pub fn serve_axum_with(app: App, cfg: AppConfig) {
     set_config(cfg); // 必须在任何 config() 读取前设置(下面 run 里读路由/bind)
     set_resolver(app.resolve); // 同构 SSR 本地预取用同一 resolver
+    crate::jobs::start_worker_if_configured(); // platform! 声明了 jobs/crons → 起后台 worker 线程
+    crate::jobs::start_crons_if_configured(); // platform! 声明了 crons → 起定时调度线程(按间隔 enqueue)
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(run(app));
 }
@@ -96,6 +98,8 @@ async fn graphql(State(app): State<App>, body: axum::body::Bytes) -> impl IntoRe
 /// 经 transport 接缝注入 —— SSR 同步预取在 spawn_blocking 线程上 `Handle::block_on(schema.execute())` 合法、不 panic
 /// (该线程非 runtime worker)。在 serve_axum 前调用(先占住 transport;serve_axum 内 set_resolver 的 legacy
 /// set_transport 因 OnceLock set-once 被忽略)。Response 经 serde_json 序列化成标准 {data,errors?} JSON。
+/// 可选路线(feature = "graphql_async");默认走 rui 自带同步 exec 引擎 + native ORM(gql::orm)。
+#[cfg(feature = "graphql_async")]
 pub fn set_graphql_schema<E>(schema: E)
 where
     E: async_graphql::Executor,

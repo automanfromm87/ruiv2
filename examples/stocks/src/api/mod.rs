@@ -6,6 +6,10 @@ pub mod schema;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod todos;
 
+// 后台 AsyncJob(`#[rui::job]`):native-only,由 mutation 入队、worker 异步执行。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod jobs;
+
 // PG 数据后端(DATABASE_URL 存在时用,否则 resolver 回退 todos 内存)。
 #[cfg(not(target_arch = "wasm32"))]
 pub mod db;

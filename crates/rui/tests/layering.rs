@@ -47,6 +47,7 @@ fn no_upward_or_crosslayer_edges() {
         ("gql/exec.rs", include_str!("../src/gql/exec.rs")),
         ("gql/value.rs", include_str!("../src/gql/value.rs")),
         ("gql/parser.rs", include_str!("../src/gql/parser.rs")),
+        ("gql/orm.rs", include_str!("../src/gql/orm.rs")),
     ] {
         assert_no(src, f, &["crate::server", "crate::runtime", "crate::view"]);
     }

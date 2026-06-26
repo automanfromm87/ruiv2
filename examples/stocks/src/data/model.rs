@@ -1,42 +1,20 @@
 //! 共享数据模型 —— 前端(wasm)与后端(SSR)直接共用。
-//! `#[derive(GqlObject)]` 生成客户端类型层(Field 投影 / 编解码 / entity id);
-//! native 额外 `#[derive(async_graphql::SimpleObject)]` 生成服务端 async-graphql 对象类型(双 schema / B2)。
-//! 两个 derive 的 helper attr 互不干扰:`#[gql(..)]` 归 GqlObject,`#[graphql(..)]` 归 SimpleObject。
-//! rename_fields="snake_case":让 async-graphql 字段名与客户端 selection 的 snake_case 一致(默认会改成 camelCase)。
+//! `#[derive(Ent)]` 是**单一真相源**:同一个 struct 同时是 GraphQL 对象类型(同构,Field 投影 / 编解码 / entity id)
+//! + 表映射(native:`#[ent(table=..)]` + #[gql(id)] 主键 → SqlEntity)。
+//! 不再有 GqlObject + async-graphql SimpleObject + sqlx FromRow 三重 derive,也不再有双 schema。
+//! selection → SQL 列投影由 rui::gql::orm 在运行期完成(`{ todos { id } }` → `select id from todos`)。
+//!
+//! Relay 分页三件套也**随 Ent 自动生成**:`TodoEdge` / `TodoPageInfo` / `TodoConnection`(+ 原生
+//! `TodoConnection::page(first, after)` 切片器)。归档页 `paginated!(todo_page ...)` 与 schema 的
+//! `todo_page` resolver 直接用,无需在此手写这些 value object。
 
-use rui::GqlObject;
+use rui::Ent;
 
-#[derive(Clone, PartialEq, GqlObject)]
-#[cfg_attr(not(target_arch = "wasm32"), derive(async_graphql::SimpleObject, sqlx::FromRow))]
-#[cfg_attr(not(target_arch = "wasm32"), graphql(rename_fields = "snake_case"))]
+#[derive(Clone, PartialEq, Ent)]
+#[ent(table = "todos")]
 pub struct Todo {
     #[gql(id)]
     pub id: String,
     pub text: String,
     pub done: bool,
-}
-
-// Relay connection 分页三件套(归档页用):value object,无 #[gql(id)] —— 真正的 entity 是 edge.node。
-#[derive(Clone, GqlObject)]
-#[cfg_attr(not(target_arch = "wasm32"), derive(async_graphql::SimpleObject))]
-#[cfg_attr(not(target_arch = "wasm32"), graphql(rename_fields = "snake_case"))]
-pub struct TodoEdge {
-    pub node: Todo,
-    pub cursor: String,
-}
-
-#[derive(Clone, GqlObject)]
-#[cfg_attr(not(target_arch = "wasm32"), derive(async_graphql::SimpleObject))]
-#[cfg_attr(not(target_arch = "wasm32"), graphql(rename_fields = "snake_case"))]
-pub struct PageInfo {
-    pub has_next_page: bool,
-    pub end_cursor: String,
-}
-
-#[derive(Clone, GqlObject)]
-#[cfg_attr(not(target_arch = "wasm32"), derive(async_graphql::SimpleObject))]
-#[cfg_attr(not(target_arch = "wasm32"), graphql(rename_fields = "snake_case"))]
-pub struct TodoConnection {
-    pub edges: Vec<TodoEdge>,
-    pub page_info: PageInfo,
 }

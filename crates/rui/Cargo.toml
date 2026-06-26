@@ -11,12 +11,13 @@ rui-macros = { path = "../rui-macros" }
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "sync", "signal", "time"] }
 tokio-stream = { version = "0.1", optional = true }
-# 生产 GraphQL 引擎(async resolver + per-request Context + DataLoader)。与 axum 同档:只随 axum host 到来。
+# 可选 async-graphql 引擎(feature = "graphql_async")。默认不拉 —— rui 自带同步 exec 引擎 + native ORM 是主路线。
 async-graphql = { version = "7.2.1", optional = true }
-async-graphql-axum = { version = "7.2.1", optional = true }
-serde_json = { version = "1", optional = true } # 序列化 async-graphql Response → JSON(已在 async-graphql 依赖树内)
+serde_json = { version = "1", optional = true } # 序列化 async-graphql Response → JSON(仅 graphql_async)
 
 [features]
-# 启用后可用 rui::serve_axum(生产网络栈:有界并发 / 优雅关闭 / body 上限 / SSE keep-alive)+ async-graphql 引擎。
-# 不启用则只有零依赖的 std rui::serve(手搓 GraphQL 引擎 exec.rs)。
-axum = ["dep:axum", "dep:tokio", "dep:tokio-stream", "dep:async-graphql", "dep:async-graphql-axum", "dep:serde_json"]
+# 启用后可用 rui::serve_axum(生产网络栈:有界并发 / 优雅关闭 / body 上限 / SSE keep-alive)。
+# 不启用则只有零依赖的 std rui::serve。两者都走 rui 自带同步 GraphQL 引擎(exec.rs)+ native ORM(gql::orm)。
+axum = ["dep:axum", "dep:tokio", "dep:tokio-stream"]
+# 可选:换用 async-graphql 作为 GraphQL 引擎(rui::set_graphql_schema)。蕴含 axum。与 native ORM 路线互斥。
+graphql_async = ["axum", "dep:async-graphql", "dep:serde_json"]

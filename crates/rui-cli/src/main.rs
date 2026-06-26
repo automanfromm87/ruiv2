@@ -17,9 +17,10 @@ fn main() {
         Some("init") => init(args.get(1).map(String::as_str)),
         Some("dev") => build_and_run(false, true),
         Some("build") => build_and_run(true, false),
+        Some("plan") => plan(),
         _ => {
             eprintln!(
-                "rui —— 全栈 Rust 框架 CLI\n\n  rui init <name>   脚手架一个新项目\n  rui dev           构建 + 起 SSR 开发服务器(http://127.0.0.1:8084)\n  rui build         生产构建"
+                "rui —— 全栈 Rust 框架 CLI\n\n  rui init <name>   脚手架一个新项目\n  rui dev           构建 + 起 SSR 开发服务器(http://127.0.0.1:8084)\n  rui build         生产构建\n  rui plan          从 platform! 推导部署 DAG + provision plan(不连数据库 / 不起服务)"
             );
             std::process::exit(1);
         }
@@ -150,6 +151,16 @@ fn tailwind(release: bool) {
     }
 }
 
+// ───────────────────────── plan ─────────────────────────
+
+/// `rui plan`:跑 ssr bin 的 `plan` 模式(`maybe_plan` 会打印部署 plan 并退出,不连 DB、不起服务)。
+fn plan() {
+    if !Path::new("Cargo.toml").exists() {
+        die("当前目录没有 Cargo.toml —— 请在 rui 项目根目录运行");
+    }
+    run_cargo(&["run", "--quiet", "--bin", "ssr", "--", "plan"]);
+}
+
 // ───────────────────────── init ─────────────────────────
 
 fn init(name: Option<&str>) {
@@ -180,6 +191,7 @@ fn init(name: Option<&str>) {
         ),
         ("tailwind.css", TPL_TAILWIND.to_string()),
         ("src/lib.rs", TPL_LIB.to_string()),
+        ("src/app.rs", TPL_APP.to_string()), // App 装配:platform! + client! + 404
         ("src/bin/ssr.rs", TPL_SSR.replace("{NAME}", &name.replace('-', "_"))),
         // 目录即规范:生成 data/api/view 空骨架(mod.rs 仅注释引导,按需往里填)。
         ("src/data/mod.rs", TPL_DATA_MOD.to_string()),
@@ -221,6 +233,7 @@ fn framework_crates() -> PathBuf {
 const TPL_CARGO: &str = include_str!("../templates/Cargo.toml.tpl");
 const TPL_TAILWIND: &str = include_str!("../templates/tailwind.css.tpl");
 const TPL_LIB: &str = include_str!("../templates/lib.rs.tpl");
+const TPL_APP: &str = include_str!("../templates/app.rs.tpl");
 const TPL_SSR: &str = include_str!("../templates/ssr.rs.tpl");
 const TPL_DATA_MOD: &str = include_str!("../templates/data_mod.rs.tpl");
 const TPL_API_MOD: &str = include_str!("../templates/api_mod.rs.tpl");

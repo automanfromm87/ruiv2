@@ -1,21 +1,18 @@
-//! todo SSR 服务器:把 route / resolve / SSE(订阅广播)装进 rui::App 启动。
+//! todo SSR 服务器:注入存储后端 → 启动 platform! 统一装配出的 AppRuntime(app())。
+//! 路由 / API / resolve / 订阅都在 crate::lib 的 `rui::platform! { .. }` 一处声明,这里不再手搓。
 
 fn main() {
-    // 生产后端:axum + tokio(有界并发 / 优雅关闭 / body 上限 / SSE keep-alive)。
-    // 想退回零依赖 std 服务器,把 serve_axum 换成 serve 即可(同签名)。
-    // 想自定义宿主(bind / 资源路由 / body 上限 / HTML 外壳 / router.js):用 serve_axum_with(app, AppConfig)/serve_with,例:
-    //   rui::serve_axum_with(app, rui::AppConfig { bind: ("0.0.0.0".into(), 3000), ..Default::default() });
-    // GraphQL 引擎:注册 async-graphql Schema(/graphql + SSR 预取都经它执行)。须在 serve_axum 前(先占住 transport)。
-    // DATABASE_URL 存在 → 注入 PgPool(resolver 走 PG);否则 None → resolver 回退内存。
-    let pg = stocks::api::db::Pg::from_env();
-    rui::set_graphql_schema(stocks::api::schema::ag::build_schema(pg));
-    rui::serve_axum(rui::App {
-        route: stocks::route,
-        resolve: stocks::api::schema::resolve, // 仍传(std host / legacy fallback 用;axum 路径已走 async-graphql transport)
+    // `cargo run --bin ssr -- plan`(即 rui plan):打印部署 DAG + provision plan 后退出(在连 DB 之前)。
+    rui::maybe_plan(stocks::describe);
 
-        sse: Some(rui::Sse {
-            snapshot: stocks::api::todos::snapshot_json,
-            subscribe: stocks::api::todos::add_subscriber,
-        }),
-    });
+    // 数据后端:DATABASE_URL 存在且连接成功 → PostgreSQL(同步 postgres 驱动),否则内存(回退)。
+    // 经 rui 的 ORM 注入接缝 set_db_executor 注册;resolver 经 rui::gql::orm::fetch/write 走它(selection→SQL 投影)。
+    // 必须在 serve_axum 前注册(resolver 首次执行前)。
+    rui::gql::orm::set_db_executor(stocks::api::db::backend());
+
+    // 生产后端:axum + tokio(有界并发 / 优雅关闭 / body 上限 / SSE keep-alive)。
+    // GraphQL 引擎走 rui 自带同步 exec(serve_axum 内 set_resolver 注入 transport)—— 不再用 async-graphql,无双 schema。
+    // 想退回零依赖 std 服务器,把 serve_axum 换成 serve 即可(同签名)。
+    // 统一装配:platform! 生成的 app() 一处声明路由 + resolve + 订阅 → AppRuntime。
+    rui::serve_axum(stocks::app());
 }

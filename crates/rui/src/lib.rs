@@ -53,23 +53,42 @@ pub use runtime::{
 #[cfg(not(target_arch = "wasm32"))]
 pub mod server;
 
+// AsyncJob:后台异步任务(`#[rui::job]` + `enqueue::<J>` + `platform!{ jobs{} }`)。native-only 计算,
+// 与 HTTP 表面正交;payload 走 gql::value,队列依赖倒置(默认内存)→ 零依赖默认 + 同构不变。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod jobs;
+
+// 部署模型(Pillar 3):platform! 生成的 `describe() -> AppModel`,`rui plan` 据此打印部署 DAG + provision plan。
+#[cfg(not(target_arch = "wasm32"))]
+pub mod deploy;
+#[cfg(not(target_arch = "wasm32"))]
+pub use deploy::{maybe_plan, AppModel};
+#[cfg(not(target_arch = "wasm32"))]
+pub use jobs::{
+    enqueue, set_crons, set_job_dispatch, set_queue_executor, CronJob, CronTick, Job, JobCtx, JobError, JobResult,
+    QueueExecutor,
+};
+
 // 生产 HTTP 后端(feature = "axum"):rui::serve_axum(App) / serve_axum_with(App, AppConfig)。仅非 wasm。
 #[cfg(all(not(target_arch = "wasm32"), feature = "axum"))]
 pub mod server_axum;
-// set_graphql_schema:注册 async-graphql Schema 作为 GraphQL 引擎(应用直接 dep async-graphql 定义 schema,
-// 与 rui 同版本 → cargo 统一为一份,Schema 满足 rui 这边的 async_graphql::Executor bound)。
 #[cfg(all(not(target_arch = "wasm32"), feature = "axum"))]
-pub use server_axum::{serve_axum, serve_axum_with, set_graphql_schema};
+pub use server_axum::{serve_axum, serve_axum_with};
+// set_graphql_schema:注册 async-graphql Schema 作为 GraphQL 引擎(可选 feature = "graphql_async")。
+// 与 rui-native ORM(gql::orm + #[derive(Ent)])是两条互斥路线 —— 默认走 rui 自带同步 exec 引擎,
+// async-graphql 仅在显式启用该 feature 时编译进来(故默认 axum host 不再拉 async-graphql)。
+#[cfg(all(not(target_arch = "wasm32"), feature = "graphql_async"))]
+pub use server_axum::set_graphql_schema;
 
-// 宏:应用直接用 rui::view! / rui::query! / #[derive(rui::GqlObject)] / #[rui::gql_root(..)] 等。
+// 宏:应用直接用 rui::view! / rui::query! / #[derive(rui::GqlObject)] / #[derive(rui::Ent)] / #[rui::gql_root(..)] 等。
 pub use rui_macros::{
-    app, component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource,
-    router, subscription, view, GqlObject,
+    app, component, cron, fragment, gql_fields, gql_root, gql_schema, job, mutation, page, paginated, platform,
+    query, resource, route, router, subscription, view, Ent, GqlObject,
 };
 
 // 宿主:serve(零配置)/ serve_with(自定义 AppConfig:bind / 资源路由 / body 上限 / HTML 外壳 / router.js)。
 #[cfg(not(target_arch = "wasm32"))]
-pub use server::{default_shell, serve, serve_with, App, AppConfig, AssetMap, ShellCtx, Sse};
+pub use server::{default_shell, serve, serve_with, App, AppConfig, AppRuntime, AssetMap, ShellCtx, Sse};
 
 // 占位 resolver:最小骨架(无数据层)用它满足 App.resolve,接入 #[gql_root] 后替换。
 #[cfg(not(target_arch = "wasm32"))]
@@ -82,7 +101,7 @@ pub mod prelude {
     pub use crate::dom::{event, Event};
     pub use crate::view::{error_reporter, throw_error, IntoView, View};
     pub use rui_macros::{
-        component, fragment, gql_fields, gql_root, gql_schema, mutation, page, paginated, query, resource, router,
-        subscription, view, GqlObject,
+        component, cron, fragment, gql_fields, gql_root, gql_schema, job, mutation, page, paginated, platform,
+        query, resource, route, router, subscription, view, Ent, GqlObject,
     };
 }
